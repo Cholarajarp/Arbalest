@@ -1,0 +1,8 @@
+# Development, CI, and release-validation tools. Runtime dependencies belong
+# exclusively in requirements.txt so production images do not contain them.
+ruff==0.15.21
+mypy==2.3.0
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pip-audit
+bandit==1.9.4
