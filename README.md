@@ -83,6 +83,104 @@ Bring your own supported model provider and credentials. See
 [Configuration](#-configuration) for hosted APIs, gateways, local models,
 and compatible endpoints.
 
+## 🧑‍⚖️ Testing instructions (judges and reviewers)
+
+These steps reproduce the [demo video](https://youtu.be/MnC_G6D2CVw) on your
+own Nebius account. Arbalest does not ship with credentials; you need your own.
+
+**Requirements**
+
+* Python 3.12 or newer and Git.
+* A Nebius Token Factory API key, from <https://tokenfactory.nebius.com/>.
+* A Nebius project ID with access to Nebius Token Factory Sandboxes. Without
+  it, Arbalest falls back to local Docker for sandbox runs, and then Docker
+  must be installed and running.
+* Optional: a Tavily API key for live threat intelligence lookups. Scans work
+  without it.
+
+**1. Install**
+
+```bash
+git clone https://github.com/Cholarajarp/Arbalest.git
+cd Arbalest
+python -m venv .venv
+source .venv/bin/activate          # Windows Git Bash: source .venv/Scripts/activate
+pip install -e .
+```
+
+**2. Add your credentials**
+
+```bash
+cp .env.example .env
+```
+
+Open `.env` and set:
+
+```bash
+ARBALEST_PROVIDER=nebius
+NEBIUS_API_KEY=<your-nebius-api-key>
+NEBIUS_PROJECT_ID=<your-nebius-project-id>
+ARBALEST_MODEL=nvidia/Nemotron-3-Ultra-550b-a55b
+# Optional:
+# TAVILY_API_KEY=<your-tavily-key>
+```
+
+Run the commands below from the repository root so Arbalest finds this `.env`.
+Never commit it; it is already in `.gitignore`.
+
+**3. Check the provider and prove the sandbox is sealed**
+
+```bash
+arbalest providers
+arbalest sandbox-check; echo "exit code: $?"
+```
+
+`sandbox-check` runs a hello probe, then a network probe that must fail.
+Expected: `exit code: 0`. Exit code `1` means the sandbox could reach the
+network, and `2` means the sandbox is not configured, the probe failed, or the
+result was inconclusive.
+
+**4. Scan a vulnerable demo service**
+
+```bash
+arbalest scan examples/billing_demo --format html -o arbalest-report.html; echo "exit code: $?"
+```
+
+Expected: findings that include SQL injection, command injection, code
+injection and hardcoded credentials, verdict `VULNERABLE` and `exit code: 1`.
+Open `arbalest-report.html` in a browser to read the report
+(Windows: `start arbalest-report.html`, macOS: `open`, Linux: `xdg-open`).
+
+**5. Patch, attack the patch, and certify (immune wargame)**
+
+```bash
+rm -rf examples/billing_immune/.arbalest
+arbalest immune examples/billing_immune --max-findings 2 --iterations 3; echo "exit code: $?"
+```
+
+For each finding, the Architect writes a patch and the Red Team runs an attack
+against it in the sandbox. When the patch holds the finding is `HEALED`, and if
+every finding heals the verdict is `SECURED` with `exit code: 0`. Model output
+varies between runs: if a patch is breached, the Architect repairs it and
+attacks again, and a finding that cannot be certified within the iteration
+budget is reported as `UNRESOLVED` with `exit code: 1`.
+
+**6. Review the staged patch**
+
+```bash
+cat examples/billing_immune/.arbalest/proposed-heals/*.patch
+```
+
+Each `.patch` file is a unified diff of one verified fix.
+
+Patches are staged for human review and the source is not changed. Passing
+`--deploy` writes verified patches into the working tree.
+
+If you set `NEBIUS_PROJECT_ID`, each sandbox run appears as an operation in
+your Nebius Token Factory console. Runs use your Nebius account's credits. The
+demo apps are only read by Arbalest, never executed on your machine, so Flask
+is not required.
+
 ### 🧪 Verification sandbox
 
 `verify`, `immune`, `fleet` and `evolve` execute code that a model wrote, so
