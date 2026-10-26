@@ -105,3 +105,15 @@ def test_antibody_sweep_respects_language(tmp_path: Path):
     lab.registry.save(antibody)
     loaded = load_antibodies(tmp_path)
     assert antibody_sweep("impl.js", VULNERABLE, loaded) == []
+
+
+def test_known_antibody_patterns_summarize_saved_antibodies(tmp_path):
+    from engine.services.scan_pipeline import known_antibody_patterns
+
+    assert known_antibody_patterns(tmp_path) is None
+    lab = AntibodyLab(provider=None, root=tmp_path)
+    antibody = lab.build_and_test(_spec(), finding=_finding(),
+                                  vulnerable_code=VULNERABLE, patched_code=PATCHED)
+    lab.registry.save(antibody)
+    patterns = known_antibody_patterns(tmp_path)
+    assert patterns and patterns[0].startswith(f"{antibody.rule_id} ({antibody.cwe}): ")

@@ -55,8 +55,8 @@ class JsTaintResult:
     interpretations: int = 0
 
 
-def _tokens(text: str) -> list[tuple[str, str]]:
-    output: list[tuple[str, str]] = []
+def _tokens(text: str) -> list[tuple[str, str, int]]:
+    output: list[tuple[str, str, int]] = []
     position = 0
     line = 1
     while position < len(text):
@@ -69,9 +69,9 @@ def _tokens(text: str) -> list[tuple[str, str]]:
         if kind == "ws":
             line += value.count("\n")
         else:
-            output.append((kind, value, line))  # type: ignore[arg-type]
+            output.append((kind, value, line))
         position = match.end()
-    return output  # type: ignore[return-value]
+    return output
 
 
 def _line_of(tokens: list[tuple[str, str, int]], index: int) -> int:

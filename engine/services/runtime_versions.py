@@ -331,7 +331,7 @@ async def check_runtime_declarations(
 
     products = sorted({component for component, _ in by_key if component in _EOL_PRODUCTS})
     owns_client = client is None
-    if owns_client:
+    if client is None:
         client = httpx.AsyncClient(timeout=_EOL_TIMEOUT, follow_redirects=True)
     try:
         for product in products:

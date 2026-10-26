@@ -15,6 +15,7 @@ import json
 import math
 import os
 import re
+import sys
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -146,7 +147,7 @@ class _Checkpoint:
             directory.mkdir(parents=True, exist_ok=True)
             self.handle = (directory / "scan-workflow.lock").open("a+b")
             self.handle.seek(0)
-            if os.name == "nt":
+            if sys.platform == "win32":
                 import msvcrt
 
                 if not self.handle.read(1):

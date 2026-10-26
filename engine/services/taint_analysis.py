@@ -11,9 +11,13 @@ import hashlib
 import posixpath
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from engine.agents.architect_agent import Severity, ThreatFinding
+
+if TYPE_CHECKING:
+    from engine.services.taint_go import GoTaintResult
+    from engine.services.taint_js import JsTaintResult
 
 _KINDS = frozenset({"sql", "shell", "eval", "path"})
 _CWES = {"sql": "CWE-89", "shell": "CWE-78", "eval": "CWE-95", "path": "CWE-22"}
@@ -931,11 +935,15 @@ def analyze_taint(sources: Mapping[str, str], *, limits: TaintLimits | None = No
     for subset_sources, analyzer in ((js_sources, "js"), (go_sources, "go")):
         if not subset_sources:
             continue
+        subset: JsTaintResult | GoTaintResult
         if analyzer == "js":
-            from engine.services.taint_js import analyze_js_taint as analyze_subset
+            from engine.services.taint_js import analyze_js_taint
+
+            subset = analyze_js_taint(subset_sources)
         else:
-            from engine.services.taint_go import analyze_go_taint as analyze_subset
-        subset = analyze_subset(subset_sources)
+            from engine.services.taint_go import analyze_go_taint
+
+            subset = analyze_go_taint(subset_sources)
         result.findings.extend(subset.findings)
         coverage = result.coverage
         coverage.supported_files += len(subset.analyzed_paths)

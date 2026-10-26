@@ -43,6 +43,12 @@ _SUMMARY_STOP = frozenset({
 })
 
 
+def known_antibody_patterns(root: Path, limit: int = 8) -> list[str] | None:
+    """Summaries of validated antibodies, passed to SAST as previously confirmed patterns."""
+    patterns = [f"{item.rule_id} ({item.cwe}): {item.message}" for item in load_antibodies(root)]
+    return patterns[:limit] or None
+
+
 def _summary_tokens(summary: str) -> frozenset[str]:
     return frozenset(
         word for word in re.findall(r"[a-z0-9]+", summary.lower())
@@ -255,12 +261,7 @@ async def _run_agent_swarm(
         known_patterns: list[str] | None = None
         if recon is not None and recon.root_path:
             try:
-                antibodies = load_antibodies(Path(recon.root_path))
-                known_patterns = [
-                    f"{item.threat_name} ({item.cwe}): {item.message}"
-                    for item in antibodies
-                    if getattr(item, "validated", False)
-                ][:8] or None
+                known_patterns = known_antibody_patterns(Path(recon.root_path))
             except Exception:  # noqa: BLE001 - learning memory is advisory, never fatal
                 known_patterns = None
         if review_priorities and known_patterns:
