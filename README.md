@@ -29,6 +29,32 @@ model provider; generated code executes only in a configured isolated sandbox.
 Model and sandbox providers are configured independently. Incomplete scans
 return a mission error instead of a clean verdict.
 
+## NVIDIA Nemotron and Nebius
+
+Arbalest's default configuration runs on NVIDIA Nemotron through Nebius Token
+Factory, and runs attack code in Nebius Token Factory Sandboxes.
+
+* **Model:** `nvidia/Nemotron-3-Ultra-550b-a55b`, the default in
+  [`engine/services/provider_catalog.py`](engine/services/provider_catalog.py).
+  Every model-driven agent uses it: source review (SAST), threat analysis
+  (Threat RAG), the Architect that plans fixes, the Translator that writes
+  patches, and the Red Team that writes attack harnesses.
+* **Token Factory inference API:** Arbalest calls the OpenAI-compatible
+  chat completions endpoint `https://api.tokenfactory.nebius.com/v1/`. Each
+  agent passes its JSON schema in the system prompt, and every response is
+  validated with Pydantic before the next stage uses it. Being a hosted API, it lets Arbalest use a 550B model
+  without running any GPUs itself.
+* **Token Factory Sandboxes:** each Red Team attack runs in a disposable
+  microVM with networking disabled, a wall-clock timeout, truncated output and
+  cancellation
+  ([`engine/services/nebius_sandbox.py`](engine/services/nebius_sandbox.py)).
+  `arbalest sandbox-check` proves the sandbox has no network before any
+  generated code runs, and each run appears as an operation in the Nebius
+  console.
+
+Other providers and local Docker are supported as alternatives; see
+[Configuration](#-configuration).
+
 ---
 
 ## Bounded security workflows
