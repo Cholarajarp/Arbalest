@@ -486,9 +486,9 @@ class BudgetedProvider(AIProvider):
         self._workflow.reserve(calls)
         timeout = min(self._workflow.remaining(), self._workflow.options.call_timeout_seconds)
         call_deadline = time.monotonic() + timeout
-        async with asyncio.timeout(timeout):
+        async with asyncio.timeout(timeout) as call_timeout:
             result = await getattr(self._provider, method)(*args, **kwargs)
-        if time.monotonic() >= call_deadline:
+        if call_timeout.expired() or time.monotonic() >= call_deadline:
             raise ScanBudgetExceeded("provider call deadline exhausted")
         self._workflow.remaining()
         return result
