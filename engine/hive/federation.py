@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from engine.immune.detection import DetectionFinding
-from engine.immune.topology import TopologyMapper
+from engine.immune.topology import TopologyMapper, _Func
 
 MAX_FLEET_NODES = 4000
 MAX_FLEET_EDGES = 12000
@@ -193,7 +193,7 @@ class FleetTopology:
                 inner.fleet = fleet
                 inner.host_repo = host_repo
 
-            def _owner(self, lineno: int) -> dict | None:
+            def _owner(self, lineno: int) -> _Func | None:
                 spans = [f for f in file_funcs if f.line <= lineno <= f.end_line]
                 return min(spans, key=lambda f: f.end_line - f.line, default=None)
 
@@ -356,8 +356,9 @@ class FleetTopology:
 
         if radius.proven:
             for entry in sorted(entries)[:3]:
-                path, cursor = [entry], entry
-                while cursor != sink:
+                path = [entry]
+                cursor: str | None = entry
+                while cursor is not None and cursor != sink:
                     cursor = min(self._forward.get(cursor, ()), key=lambda n: len(self._path_to(n, sink)), default=None)
                     if cursor is None or cursor in path:
                         path = []
@@ -366,7 +367,9 @@ class FleetTopology:
                 if path and path[-1] == sink and len(path) <= 8:
                     radius.chains.append([dict(self._funcs[n]) for n in path])
 
-        downstream, queue, visited = [], deque([sink]), {sink}
+        downstream: list[str] = []
+        queue = deque([sink])
+        visited = {sink}
         while queue and len(downstream) < 50:
             current = queue.popleft()
             for nxt in self._forward.get(current, ()):

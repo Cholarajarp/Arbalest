@@ -1,0 +1,24 @@
+# Deny by default: local credentials, caches, reports and repositories stay out.
+**
+!Dockerfile
+!.dockerignore
+!pyproject.toml
+!uv.lock
+!README.md
+!LICENSE
+!arbalest_cli.py
+!mcp_server.py
+!engine/
+!engine/**/
+!engine/**/*.py
+# Defense in depth if the allowlist is expanded later.
+**/.env
+**/.env.*
+**/.git
+**/.venv
+**/__pycache__
+**/*.pyc
+**/*.pem
+**/*.key
+**/credentials*
+**/secrets*

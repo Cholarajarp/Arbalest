@@ -22,14 +22,15 @@ from pathlib import Path
 
 from engine.hive.board import FleetBoard
 from engine.hive.exchange import FleetPatternExchange
-from engine.hive.federation import FleetTopology
-from engine.hive.fleet_commander import FleetCommanderAgent
+from engine.hive.federation import FleetRadius, FleetTopology
+from engine.hive.fleet_commander import DispatchOrder, FleetCommanderAgent
 from engine.hive.gitops import FleetGitOps
 from engine.hive.registry import HiveRegistry
 from engine.immune.antibody import AntibodyError, AntibodyLab, antibody_sweep, load_antibodies
 from engine.immune.detection import DetectionFinding, sweep_sources
 from engine.immune.wargame import WargameEngine, WargameResult, finding_from_detection
 from engine.services.source_collector import collect_sources
+from engine.services.remediation_artifact import atomic_apply_mapping
 from engine.ui.terminal import (
     BLOOD_RED,
     DIM,
@@ -71,7 +72,7 @@ def discover_fleet(fleet_dir: Path) -> dict[str, Path]:
 class FleetTarget:
     repo: str
     finding: DetectionFinding
-    radius: object = None
+    radius: FleetRadius
     wargame: WargameResult | None = None
     applied_files: list[str] = field(default_factory=list)
 
@@ -95,6 +96,7 @@ async def run_fleet_mission(
     max_parallel: int = 3,
     use_sandbox: bool = True,
     gitops: bool = True,
+    deploy: bool = False,
 ) -> int:
     t0 = time.perf_counter()
     incident = uuid.uuid4().hex[:8]
@@ -117,6 +119,10 @@ async def run_fleet_mission(
     console.phase(1, 4, "FEDERATED RECON", "🌐")
     with console.spinner("FLEET SENSORS — discovering repositories"):
         repos = discover_fleet(fleet_dir)
+    if gitops:
+        non_git = sorted(name for name, path in repos.items() if not FleetGitOps.is_repo(path))
+        if non_git:
+            console.note(f"non-Git repositories will be analyzed but cannot enter GitOps: {', '.join(non_git[:8])}")
     if not repos:
         console.error("No repositories with source code found under the fleet directory.")
         return EXIT_MISSION_ERROR
@@ -191,6 +197,11 @@ async def run_fleet_mission(
             console.line("  " + palette(" ⛓ ", QUANTUM_MAGENTA, bold=True).join(hops), QUANTUM_MAGENTA)
         console.line(f"  ⛓ {radius.verdict}", QUANTUM_MAGENTA if radius.proven else GRAY, bold=True)
 
+    if not use_sandbox:
+        console.note("analysis-only mode: sandbox verification was disabled; no fleet patch, learning, or GitOps is permitted")
+        console.verdict({}, len(targets), EXIT_FLEET_VULNERABLE, None, time.perf_counter() - t0)
+        return EXIT_FLEET_VULNERABLE
+
     # ── Arm the AI core (real) ────────────────────────────────────────────
     try:
         provider = provider_factory()
@@ -213,20 +224,30 @@ async def run_fleet_mission(
             board.update(target.repo, cwe=target.finding.cwe,
                          sink=f"{target.finding.file}:{target.finding.line}",
                          status="WARGAMING", sandbox="docker")
+            sandbox = None
             try:
                 sandbox = sandbox_factory()
+                await sandbox.healthcheck()
+                def left_log(line: str, repo: str = target.repo) -> None:
+                    console.line(f"  ▣ [{repo}] ARCH ▸ {line}", DIM)
+
+                def right_log(line: str, repo: str = target.repo) -> None:
+                    console.line(f"  ▣ [{repo}] REDTEAM ▸ {line}", BLOOD_RED)
+
                 engine = WargameEngine(
                     provider=provider, sandbox=sandbox, max_iterations=max_iterations,
-                    left_log=lambda line, _r=target.repo: console.line(f"  ▣ [{_r}] ARCH ▸ {line}", DIM),
-                    right_log=lambda line, _r=target.repo: console.line(f"  ▣ [{_r}] REDTEAM ▸ {line}", BLOOD_RED),
+                    left_log=left_log, right_log=right_log,
                 )
                 wargame = await engine.run(
                     sources_by_repo[target.repo], finding_from_detection(target.finding),
                 )
             except Exception as exc:  # noqa: BLE001 — one lost duel never aborts the fleet
                 console.error(f"WARGAME FAILED [{target.repo}]: {exc}")
-                board.update(target.repo, status="HELD", sandbox="docker")
+                board.update(target.repo, status="HELD", sandbox="offline")
                 return None
+            finally:
+                if sandbox is not None:
+                    await sandbox.aclose()
             board.update(
                 target.repo,
                 iter=str(len(wargame.iterations)),
@@ -241,47 +262,67 @@ async def run_fleet_mission(
             console.line(f"  ⬡ DISPATCH [{order.kind}] {order.repo} — {order.rationale}", QUANTUM_MAGENTA)
 
         target.wargame = await fight(target)
-        if target.resolved and target.wargame.final_bundle:
-            target.applied_files = _deploy(console, repos[target.repo], target.wargame)
+        if target.wargame is not None and target.wargame.resolved and target.wargame.final_bundle:
+            if deploy:
+                target.applied_files = _deploy(console, repos[target.repo], target.wargame)
+            else:
+                _stage_heal(console, repos[target.repo], target.wargame)
 
-        downstream = [o for o in plan.orders if o.kind == "downstream" and o.finding]
+        downstream: list[tuple[DispatchOrder, DetectionFinding]] = []
+        for order in plan.orders:
+            if order.kind == "downstream" and order.finding is not None:
+                downstream.append((order, order.finding))
         if downstream:
-            outcomes = await asyncio.gather(
-                *(fight(FleetTarget(repo=o.repo, finding=o.finding)) for o in downstream),
+            wargame_outcomes = await asyncio.gather(
+                *(
+                    fight(FleetTarget(repo=order.repo, finding=finding, radius=topology.trace(order.repo, finding)))
+                    for order, finding in downstream
+                ),
                 return_exceptions=True,
             )
-            for order, outcome in zip(downstream, outcomes):
+            for (order, finding), outcome in zip(downstream, wargame_outcomes):
                 if isinstance(outcome, BaseException):
                     console.error(f"WARGAME FAILED [{order.repo}]: {outcome}")
                 elif outcome and outcome.resolved and outcome.final_bundle:
-                    applied_files = _deploy(console, repos[order.repo], outcome)
+                    if deploy:
+                        applied_files = _deploy(console, repos[order.repo], outcome)
+                    else:
+                        applied_files = []
+                        _stage_heal(console, repos[order.repo], outcome)
                     sibling = next(
-                        (t for t in traced if t.repo == order.repo and t.finding.rule_id == order.finding.rule_id),
+                        (item for item in traced if item.repo == order.repo and item.finding.rule_id == finding.rule_id),
                         None,
                     )
                     if sibling is None:
-                        sibling = FleetTarget(repo=order.repo, finding=order.finding, wargame=outcome,
-                                              applied_files=applied_files)
+                        sibling = FleetTarget(
+                            repo=order.repo, finding=finding, radius=topology.trace(order.repo, finding),
+                            wargame=outcome, applied_files=applied_files,
+                        )
                         traced.append(sibling)
                         targets.append(sibling)
                     else:
                         sibling.wargame = outcome
                         sibling.applied_files = applied_files
 
-    # Antibody broadcast — the origin cure immunizes the entire fleet (gold).
-    origin = next((t for t in targets if t.resolved and t.wargame.breach_history), None)
-    if origin is not None:
+    origin = next(
+        (item for item in targets if item.wargame is not None and item.wargame.resolved and item.wargame.breach_history),
+        None,
+    )
+    if origin is not None and origin.wargame is not None:
+        origin_wargame = origin.wargame
         lab = AntibodyLab(provider=provider, root=repos[origin.repo])
         try:
             antibody = await lab.synthesize(
                 finding=origin.finding,
                 vulnerable_code=sources_by_repo[origin.repo].get(origin.finding.file, ""),
                 patched_code=(
-                    origin.wargame.final_bundle.file_mapping().get(origin.finding.file, "")
-                    if origin.wargame.final_bundle else ""
+                    origin_wargame.final_bundle.file_mapping().get(origin.finding.file, "")
+                    if origin_wargame.final_bundle else ""
                 ),
-                breach_history=origin.wargame.breach_history,
+                breach_history=origin_wargame.breach_history,
             )
+            if not antibody.validated:
+                raise AntibodyError(f"antibody self-test failed: {antibody.validation_detail}")
             lab.registry.save(antibody)
             hive.broadcast_antibody(antibody, origin_repo=origin.repo)
             hive_antibodies = hive_antibodies + load_antibodies(fleet_dir, directory=hive.antibody_dir)
@@ -298,7 +339,7 @@ async def run_fleet_mission(
                 f"{palette(str(len(new_hits)) + ' previously-invisible sink(s)', GOLD, bold=True)} confirmed",
                 GOLD, bold=True,
             )
-            await _publish_graph_pattern(console, fleet_dir, origin, hive)
+            await _publish_graph_pattern(console, fleet_dir, origin, hive, provider)
         except AntibodyError as exc:
             console.note(f"antibody synthesis failed: {exc}")
     else:
@@ -309,13 +350,19 @@ async def run_fleet_mission(
     # ── [4/4] FLEET GITOPS ─────────────────────────────────────────────────
     console.phase(4, 4, "FLEET GITOPS — SYNCHRONIZED REMEDIATION", "⎇")
     applied_repos = {t.repo: t.applied_files for t in targets if t.applied_files}
-    if not gitops:
+    gitops_failed = False
+    if not deploy:
+        console.note(
+            "dry-run — verified bundles staged under .arbalest/proposed-heals in each repo; "
+            "rerun with --deploy to write working trees, commit and open PRs"
+        )
+    elif not gitops:
         console.note("gitops disabled — healed files are already written to working trees.")
     elif not applied_repos:
         console.note("no verified patches to commit.")
     else:
         git = FleetGitOps(incident=incident)
-        outcomes = await asyncio.gather(
+        gitops_outcomes = await asyncio.gather(
             *(
                 asyncio.to_thread(
                     git.commit_heal,
@@ -329,18 +376,20 @@ async def run_fleet_mission(
             ),
             return_exceptions=True,
         )
-        for outcome in outcomes:
-            if isinstance(outcome, BaseException):
-                console.error(f"GITOPS FAILED: {outcome}")
+        for gitops_outcome in gitops_outcomes:
+            if isinstance(gitops_outcome, BaseException):
+                gitops_failed = True
+                console.error(f"GITOPS FAILED: {gitops_outcome}")
                 continue
-            url = outcome.pr_url or outcome.summary_path
+            url = gitops_outcome.pr_url or gitops_outcome.summary_path
             console.line(
-                f"  ⎇ [{outcome.repo}] branch {palette(outcome.branch, WHITE, bold=True)} · "
-                f"commit {palette(outcome.commit, GOLD)} · PR {url}",
+                f"  ⎇ [{gitops_outcome.repo}] branch {palette(gitops_outcome.branch, WHITE, bold=True)} · "
+                f"commit {palette(gitops_outcome.commit, GOLD)} · PR {url}",
                 GOLD,
             )
-            if outcome.pr_error and not outcome.pr_url:
-                console.line(f"      {outcome.pr_error}", GRAY)
+            if gitops_outcome.pr_error and not gitops_outcome.pr_url:
+                gitops_failed = True
+                console.line(f"      {gitops_outcome.pr_error}", GRAY)
 
     # ── FINAL DEBRIEF ──────────────────────────────────────────────────────
     console.section("FINAL DEBRIEF — FLEET RESPONSE RECORD")
@@ -358,8 +407,9 @@ async def run_fleet_mission(
             "HEALED" if resolved else "UNRESOLVED",
         ])
     console.table(["SEV", "REPO", "RULE", "ITERS", "VERDICT"], rows, max_col=30)
-    exit_code = EXIT_FLEET_SECURED if unresolved == 0 and targets else EXIT_FLEET_VULNERABLE
-    console.verdict({}, unresolved, exit_code, None, time.perf_counter() - t0)
+    exit_code = EXIT_FLEET_SECURED if unresolved == 0 and targets and not gitops_failed else EXIT_FLEET_VULNERABLE
+    await provider.aclose()
+    console.verdict({}, unresolved + int(gitops_failed), exit_code, None, time.perf_counter() - t0)
     return exit_code
 
 
@@ -367,59 +417,76 @@ def origin_finding_cwe(targets: list[FleetTarget]) -> str:
     return targets[0].finding.cwe if targets else "CWE-Unknown"
 
 
-def _deploy(console: Console, repo_path: Path, wargame: WargameResult) -> list[str]:
-    """Guarded deployment of a surviving bundle into one repository."""
-    root = repo_path.resolve()
-    written: list[str] = []
+def _stage_heal(console: Console, repo_path: Path, wargame: WargameResult) -> None:
+    """Write a conclusively verified bundle as a reviewable patch; source untouched."""
     bundle = wargame.final_bundle
-    if bundle is None:
-        return written
-    for generated in bundle.files:
-        dest = (root / generated.path).resolve()
-        if not dest.is_relative_to(root):
-            console.note(f"refusing out-of-tree bundle path: {generated.path}")
+    if bundle is None or not wargame.resolved:
+        return
+    root = repo_path.resolve()
+    sections: list[str] = []
+    for relative, content in bundle.file_mapping().items():
+        destination = (root / relative).resolve()
+        if not destination.is_file():
             continue
-        original = dest.read_text(encoding="utf-8", errors="ignore") if dest.is_file() else None
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(generated.content, encoding="utf-8")
-        written.append(generated.path)
-        if original is not None and original != generated.content:
+        original = destination.read_text(encoding="utf-8", errors="replace")
+        if original == content:
+            continue
+        sections.extend(difflib.unified_diff(
+            original.splitlines(), content.splitlines(),
+            fromfile=f"a/{relative}", tofile=f"b/{relative} (VERIFIED HEAL)", lineterm="", n=3,
+        ))
+    if not sections:
+        return
+    directory = root / ".arbalest" / "proposed-heals"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"hive-{wargame.finding.cwe if hasattr(wargame, 'finding') else 'heal'}-{uuid.uuid4().hex[:6]}.patch"
+        path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+    except OSError as exc:
+        console.error(f"staging verified heal failed: {exc}")
+        return
+    console.kv("STAGED HEAL", str(path), GOLD)
+
+
+def _deploy(console: Console, repo_path: Path, wargame: WargameResult) -> list[str]:
+    """Transactionally deploy a conclusively verified bundle."""
+    bundle = wargame.final_bundle
+    if bundle is None or not wargame.resolved:
+        return []
+    root = repo_path.resolve()
+    mapping = bundle.file_mapping()
+    for relative, content in mapping.items():
+        destination = (root / relative).resolve()
+        original = destination.read_text(encoding="utf-8", errors="replace") if destination.is_file() else None
+        if original is not None and original != content:
             diff = difflib.unified_diff(
-                original.splitlines(), generated.content.splitlines(),
-                fromfile=f"a/{generated.path}", tofile=f"b/{generated.path} (HEALED)",
-                lineterm="", n=2,
+                original.splitlines(), content.splitlines(), fromfile=f"a/{relative}",
+                tofile=f"b/{relative} (HEALED)", lineterm="", n=2,
             )
             for line in list(diff)[:14]:
                 if line.startswith("+") and not line.startswith("+++"):
                     console.line("  " + line, EMERALD)
                 elif line.startswith("-") and not line.startswith("---"):
                     console.line("  " + line, NEON_ORANGE)
-    return written
+    try:
+        atomic_apply_mapping(root, mapping)
+    except (OSError, ValueError) as exc:
+        console.error(f"transactional deployment failed: {exc}")
+        return []
+    return list(mapping)
 
 
-async def _publish_graph_pattern(console: Console, fleet_dir: Path, origin: FleetTarget, hive: HiveRegistry) -> None:
+async def _publish_graph_pattern(
+    console: Console, fleet_dir: Path, origin: FleetTarget, hive: HiveRegistry, provider
+) -> None:
     """Optional Neo4j fan-out of the learned pattern via the real ImmuneSystemAgent."""
     breach = origin.wargame.last_breach if origin.wargame else None
     if breach is None or not os.environ.get("NEO4J_URI"):
         console.kv("GRAPH MEMORY", "offline — hive antibody registry is the source of truth", GRAY)
         return
     from engine.agents.immune_system_agent import ImmuneSystemAgent
-    from engine.services.ai_provider import AIProviderSettings, create_ai_provider
     from engine.services.graph_manager import GraphManager
 
-    key = os.environ.get("AI_API_KEY", "").strip()
-    if not key:
-        console.kv("GRAPH MEMORY", "offline — no AI core for pattern synthesis", GRAY)
-        return
-    settings = AIProviderSettings(
-        provider=os.environ.get("ARBALEST_PROVIDER", "custom"),
-        api_key=key, selected_model=os.environ.get("ARBALEST_MODEL"),
-    )
-    try:
-        provider = create_ai_provider(settings)
-    except Exception as exc:  # noqa: BLE001
-        console.note(f"graph memory synthesis unavailable: {exc}")
-        return
     graph = GraphManager()
     exchange = FleetPatternExchange(hive)
     try:

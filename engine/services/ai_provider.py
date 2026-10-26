@@ -16,16 +16,39 @@ from enum import StrEnum
 from typing import Any
 
 from openai import APIConnectionError, APIError, APITimeoutError, AsyncOpenAI, InternalServerError, RateLimitError
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+
+from engine.services.provider_catalog import (
+    NEBIUS_TOKEN_FACTORY_BASE_URL,
+    ProviderCatalogError,
+    ProviderProtocol,
+    all_key_env_names,
+    builtin_provider_ids,
+    get_provider_spec,
+)
 
 
 class AIProviderName(StrEnum):
+    """Built-in provider ids with dedicated code paths. The catalog holds the rest."""
+
+    ANTHROPIC = "anthropic"
+    CLAUDE_CLI = "claude-cli"
+    CODEX_CLI = "codex-cli"
     CUSTOM = "custom"
     NEBIUS = "nebius"
+    OPENAI = "openai"
 
 
 class AIProviderError(RuntimeError):
     """A provider request failed without exposing credentials or raw vendor data."""
+
+
+class AIProviderRefusal(AIProviderError):
+    """The provider's safety layer declined the request (refusal or content filter).
+
+    Distinct from a transport failure so callers can degrade to a deterministic
+    path. Arbalest never rewords or retries a declined request to get around it.
+    """
 
 
 class AIModelInfo(BaseModel):
@@ -43,17 +66,31 @@ class AIModelInfo(BaseModel):
 
 
 class AIProviderSettings(BaseModel):
-    """Workspace-scoped BYOK configuration; secrets are never logged or returned."""
+    """Workspace-scoped BYOK or local-session configuration.
+
+    Network providers require an API key. Authenticated local CLI providers
+    deliberately receive an empty ``SecretStr`` and use only the official
+    executable's existing session; Arbalest never reads its auth files.
+    """
 
     model_config = ConfigDict(extra="forbid")
 
     provider: str = AIProviderName.CUSTOM.value
-    api_key: SecretStr = Field(min_length=8, max_length=512)
+    api_key: SecretStr = Field(default_factory=lambda: SecretStr(""), max_length=512)
+    base_url: str | None = Field(default=None, min_length=8, max_length=2_048)
     selected_model: str | None = Field(default=None, min_length=1, max_length=256)
     reasoning_effort: str | None = Field(default=None, min_length=1, max_length=32)
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_output_tokens: int = Field(default=16_000, ge=256, le=65_536)
     streaming: bool = False
+
+    @field_validator("api_key")
+    @classmethod
+    def validate_api_key_length(cls, value: SecretStr) -> SecretStr:
+        length = len(value.get_secret_value())
+        if length and length < 8:
+            raise ValueError("api_key must contain at least 8 characters")
+        return value
 
     @field_validator("reasoning_effort")
     @classmethod
@@ -68,6 +105,28 @@ class AIProviderSettings(BaseModel):
             raise ValueError("provider must be a lowercase provider identifier")
         return normalized
 
+    @field_validator("base_url")
+    @classmethod
+    def normalize_base_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/") + "/"
+        if not re.fullmatch(r"https?://[^\s/]+(?::[0-9]{1,5})?(?:/[^\s]*)?/", normalized):
+            raise ValueError("base_url must be an absolute HTTP(S) URL")
+        return normalized
+
+    @model_validator(mode="after")
+    def require_network_api_key(self) -> AIProviderSettings:
+        try:
+            needs_key = get_provider_spec(self.provider).needs_key
+        except ProviderCatalogError:
+            # Unknown ids are third-party registered adapters that own their
+            # credential policy; built-ins always resolve through the catalog.
+            needs_key = self.provider in builtin_provider_ids()
+        if needs_key and not self.api_key.get_secret_value():
+            raise ValueError(f"api_key is required for network provider '{self.provider}'")
+        return self
+
 
 class StructuredOutputRequest(BaseModel):
     """Provider-neutral request for one JSON object matching a JSON Schema."""
@@ -79,6 +138,9 @@ class StructuredOutputRequest(BaseModel):
     schema_name: str = Field(pattern=r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
     json_schema: dict[str, Any]
     max_output_tokens: int | None = Field(default=None, ge=256, le=65_536)
+    # Optional per-call model override (role routing). Transports that do not
+    # support overrides keep the provider's globally selected model.
+    model: str | None = Field(default=None, pattern=r"^[\w./:@-]{1,160}$")
 
 
 class ToolDefinition(BaseModel):
@@ -136,28 +198,33 @@ class AIProvider(abc.ABC):
         return None
 
 
-class CustomOpenAICompatibleProvider(AIProvider):
-    """OpenAI-compatible adapter with a Chat Completions path.
+class OpenAICompatibleProvider(AIProvider):
+    """Native OpenAI Responses or portable OpenAI-compatible Chat Completions.
 
-    Nebius Token Factory exposes an OpenAI-compatible endpoint that does not
-    implement the Responses API. Keeping that transport choice inside this
-    adapter lets agents retain the same provider-neutral contract. The
-    ``custom`` provider targets any user-supplied OpenAI-compatible endpoint
-    via ``AI_BASE_URL``.
+    Every catalog provider speaking an OpenAI wire protocol uses this adapter:
+    Nebius Token Factory (default), Gemini, Mistral, DeepSeek, xAI, Groq,
+    Together, Fireworks, Cerebras, OpenRouter, Vercel, Ollama, LM Studio, and
+    operator-defined endpoints. ``openai_responses`` providers use the native
+    Responses API with strict schemas; all others use Chat Completions.
     """
 
     def __init__(self, settings: AIProviderSettings) -> None:
         self._settings = settings
-        if settings.provider == AIProviderName.NEBIUS.value:
-            base_url = "https://api.studio.nebius.ai/v1"
-        elif settings.provider == AIProviderName.CUSTOM.value:
-            base_url = None  # Requires AI_BASE_URL to be set by the user
-        else:
-            raise ValueError(f"CustomOpenAICompatibleProvider does not support provider='{settings.provider}'")
+        try:
+            spec = get_provider_spec(settings.provider)
+        except ProviderCatalogError as exc:
+            raise ValueError(str(exc)) from exc
+        if spec.protocol not in (ProviderProtocol.OPENAI_CHAT, ProviderProtocol.OPENAI_RESPONSES):
+            raise ValueError(f"OpenAICompatibleProvider does not support provider='{settings.provider}'")
+        self._protocol = spec.protocol
+        env_url = os.environ.get(spec.base_url_env, "").strip() if spec.base_url_env else ""
+        base_url: str | None = settings.base_url or env_url or spec.base_url
+        if spec.base_url_required and not base_url:
+            raise ValueError(f"{settings.provider} provider requires {spec.base_url_env or 'an api_url'}")
         self._client = AsyncOpenAI(
-            base_url=os.environ.get("AI_BASE_URL", base_url),
+            base_url=base_url,
             api_key=settings.api_key.get_secret_value(),
-            timeout=60.0,
+            timeout=_request_timeout(),
             max_retries=0,
         )
 
@@ -172,7 +239,7 @@ class CustomOpenAICompatibleProvider(AIProvider):
     async def list_models(self) -> list[AIModelInfo]:
         try:
             page = await self._client.models.list()
-        except (APIError, Exception) as exc:
+        except Exception as exc:
             raise AIProviderError(f"{self.name} model discovery failed: {_safe_error(exc)}") from exc
         models: list[AIModelInfo] = []
         for item in page.data:
@@ -201,6 +268,8 @@ class CustomOpenAICompatibleProvider(AIProvider):
     def recommended_model_id(self, models: Sequence[AIModelInfo]) -> str | None:
         # This is a recommendation, not a fixed agent model. It is selected only
         # when the workspace API key's live model list contains it.
+        if self.name != AIProviderName.OPENAI.value:
+            return None
         return "gpt-5.6" if any(model.id == "gpt-5.6" for model in models) else None
 
     async def generate_structured(self, request: StructuredOutputRequest) -> str:
@@ -212,7 +281,7 @@ class CustomOpenAICompatibleProvider(AIProvider):
             text=_openai_response_format(request),
             max_output_tokens=_effective_max_output_tokens(request.max_output_tokens, self._settings.max_output_tokens),
         )
-        return response.output_text
+        return _native_openai_response_text(response)
 
     async def run_with_tools(
         self,
@@ -234,7 +303,7 @@ class CustomOpenAICompatibleProvider(AIProvider):
                 require_initial_tool_call=require_initial_tool_call,
             )
         max_output_tokens = _effective_max_output_tokens(request.max_output_tokens, self._settings.max_output_tokens)
-        use_strict_tools = self._settings.provider == AIProviderName.CUSTOM.value
+        use_strict_tools = True  # Responses API path only
         openai_tools: list[dict[str, Any]] = []
         for tool in tools:
             function_definition: dict[str, Any] = {
@@ -255,10 +324,18 @@ class CustomOpenAICompatibleProvider(AIProvider):
             max_tool_calls=64,
             max_output_tokens=max_output_tokens,
         )
+        total_calls = 0
         for turn in range(max_turns):
             calls = [item for item in response.output if getattr(item, "type", None) == "function_call"]
             if not calls:
-                return response.output_text
+                if require_initial_tool_call and turn == 0:
+                    raise AIProviderError("OpenAI model did not issue the required initial tool call")
+                return _native_openai_response_text(response)
+            if turn == max_turns - 1:
+                raise AIProviderError("OpenAI model exceeded the configured tool-call turn limit")
+            total_calls += len(calls)
+            if total_calls > 64:
+                raise AIProviderError("OpenAI model exceeded the local tool-call limit")
             tool_outputs: list[dict[str, str]] = []
             for call in calls:
                 try:
@@ -275,8 +352,6 @@ class CustomOpenAICompatibleProvider(AIProvider):
                         "output": json.dumps(result, separators=(",", ":")),
                     }
                 )
-            if turn == max_turns - 1:
-                raise AIProviderError("OpenAI model exceeded the configured tool-call turn limit")
             response = await self._create_response(
                 instructions=request.instructions,
                 input=tool_outputs,
@@ -291,8 +366,8 @@ class CustomOpenAICompatibleProvider(AIProvider):
 
     @property
     def _uses_responses_api(self) -> bool:
-        """Use native Responses API only for the Custom provider."""
-        return self._settings.provider == AIProviderName.CUSTOM.value
+        """Use the Responses API for providers whose catalog protocol requires it."""
+        return self._protocol is ProviderProtocol.OPENAI_RESPONSES
 
     async def _generate_structured_with_chat_completions(self, request: StructuredOutputRequest) -> str:
         """Generate JSON through the broadly supported Chat Completions API.
@@ -308,6 +383,7 @@ class CustomOpenAICompatibleProvider(AIProvider):
                 {"role": "user", "content": request.input_text},
             ],
             max_tokens=_effective_max_output_tokens(request.max_output_tokens, self._settings.max_output_tokens),
+            model=request.model,
         )
         return _chat_completion_text(completion)
 
@@ -328,7 +404,8 @@ class CustomOpenAICompatibleProvider(AIProvider):
             {"role": "system", "content": tool_instruction},
             {"role": "user", "content": request.input_text},
         ]
-        use_strict_tools = self._settings.provider == AIProviderName.CUSTOM.value
+        # Many compatible servers reject OpenAI strict-mode schema keywords.
+        use_strict_tools = False
         chat_tools = [
             {
                 "type": "function",
@@ -401,7 +478,7 @@ class CustomOpenAICompatibleProvider(AIProvider):
     async def _create_response(self, **kwargs: Any) -> Any:
         retryable = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)
         parameters: dict[str, Any] = {
-            "model": self._selected_model(),
+            "model": kwargs.pop("model", None) or self._selected_model(),
             "store": False,
             **kwargs,
         }
@@ -426,7 +503,7 @@ class CustomOpenAICompatibleProvider(AIProvider):
         """Call the OpenAI-compatible Chat Completions endpoint with retries."""
         retryable = (APITimeoutError, APIConnectionError, RateLimitError, InternalServerError)
         parameters: dict[str, Any] = {
-            "model": self._selected_model(),
+            "model": kwargs.pop("model", None) or self._selected_model(),
             **kwargs,
         }
         if self._settings.temperature is not None:
@@ -471,16 +548,60 @@ def register_ai_provider(provider_id: str) -> Callable[[ProviderFactory], Provid
 
 
 # Built-in adapters use the same public registration path as future providers.
-register_ai_provider(AIProviderName.CUSTOM.value)(CustomOpenAICompatibleProvider)
-register_ai_provider(AIProviderName.NEBIUS.value)(CustomOpenAICompatibleProvider)
+register_ai_provider(AIProviderName.CUSTOM.value)(OpenAICompatibleProvider)
+register_ai_provider(AIProviderName.NEBIUS.value)(OpenAICompatibleProvider)
+register_ai_provider(AIProviderName.OPENAI.value)(OpenAICompatibleProvider)
+
+
+def _anthropic_factory(settings: AIProviderSettings) -> AIProvider:
+    from engine.services.anthropic_provider import AnthropicMessagesProvider
+
+    return AnthropicMessagesProvider(settings)
+
+
+register_ai_provider(AIProviderName.ANTHROPIC.value)(_anthropic_factory)
+
+
+def _local_cli_factory(settings: AIProviderSettings) -> AIProvider:
+    from engine.services.local_cli_provider import LocalCLIProvider
+
+    return LocalCLIProvider(settings)
+
+
+register_ai_provider(AIProviderName.CODEX_CLI.value)(_local_cli_factory)
+register_ai_provider(AIProviderName.CLAUDE_CLI.value)(_local_cli_factory)
+
+
+_PROTOCOL_FACTORIES: dict[ProviderProtocol, ProviderFactory] = {
+    ProviderProtocol.OPENAI_CHAT: OpenAICompatibleProvider,
+    ProviderProtocol.OPENAI_RESPONSES: OpenAICompatibleProvider,
+    ProviderProtocol.ANTHROPIC: _anthropic_factory,
+    ProviderProtocol.LOCAL_CLI: _local_cli_factory,
+}
 
 
 def create_ai_provider(settings: AIProviderSettings) -> AIProvider:
-    """Build an adapter from the registry; third parties register their own."""
+    """Build an adapter: explicit registrations first, then the catalog protocol."""
     factory = _PROVIDER_FACTORIES.get(settings.provider)
     if factory is None:
-        raise ValueError(f"Unsupported AI provider: {settings.provider}")
+        try:
+            spec = get_provider_spec(settings.provider)
+        except ProviderCatalogError as exc:
+            raise ValueError(f"Unsupported AI provider: {settings.provider}") from exc
+        factory = _PROTOCOL_FACTORIES[spec.protocol]
     return factory(settings)
+
+
+def _request_timeout() -> float:
+    """Per-request timeout in seconds (ARBALEST_AI_TIMEOUT, default 180).
+
+    Large models writing a full code bundle can take well over a minute; a short
+    timeout would cut them off and trigger repeated, slower retries.
+    """
+    try:
+        return min(max(float(os.environ.get("ARBALEST_AI_TIMEOUT", "180")), 10.0), 900.0)
+    except ValueError:
+        return 180.0
 
 
 def _effective_max_output_tokens(requested: int | None, configured: int) -> int:
@@ -514,6 +635,7 @@ def _is_ineligible_compatible_model(provider: str, model_id: str) -> bool:
         return True
     if provider == AIProviderName.CUSTOM.value and model_id == "gpt-3.5-turbo-instruct":
         return True
+    return False
 
 
 
@@ -565,6 +687,19 @@ def _chat_structured_instruction(request: StructuredOutputRequest) -> str:
     )
 
 
+def _native_openai_response_text(response: Any) -> str:
+    status = str(getattr(response, "status", "completed") or "completed").lower()
+    if status == "incomplete":
+        raise AIProviderError("OpenAI response was incomplete")
+    output = list(getattr(response, "output", None) or [])
+    if any(getattr(item, "type", None) == "refusal" for item in output):
+        raise AIProviderRefusal("The OpenAI model declined the request")
+    text = getattr(response, "output_text", None)
+    if not isinstance(text, str) or not text.strip():
+        raise AIProviderError("OpenAI response contained no structured output text")
+    return text
+
+
 def _chat_completion_message(completion: Any) -> Any:
     choices = getattr(completion, "choices", None)
     if not isinstance(choices, list) or not choices:
@@ -576,6 +711,9 @@ def _chat_completion_message(completion: Any) -> Any:
 
 
 def _chat_message_text(message: Any) -> str:
+    refusal = getattr(message, "refusal", None)
+    if isinstance(refusal, str) and refusal.strip():
+        raise AIProviderRefusal("The model declined the request")
     content = getattr(message, "content", None)
     if not isinstance(content, str) or not content.strip():
         raise AIProviderError("OpenAI-compatible provider returned no structured output text")
@@ -583,7 +721,13 @@ def _chat_message_text(message: Any) -> str:
 
 
 def _chat_completion_text(completion: Any) -> str:
-    return _chat_message_text(_chat_completion_message(completion))
+    message = _chat_completion_message(completion)
+    finish_reason = getattr(completion.choices[0], "finish_reason", None)
+    if finish_reason == "content_filter":
+        raise AIProviderRefusal("The provider's content filter stopped the response")
+    if finish_reason == "length":
+        raise AIProviderError("OpenAI-compatible response reached its output-token limit")
+    return _chat_message_text(message)
 
 
 def _openai_reasoning_efforts(model_id: str) -> tuple[str, ...]:
@@ -596,7 +740,13 @@ def _openai_reasoning_efforts(model_id: str) -> tuple[str, ...]:
 
 
 def _safe_error(error: Exception) -> str:
-    return re.sub(r"\s+", " ", str(error)).strip()[:500] or error.__class__.__name__
+    message = re.sub(r"\s+", " ", str(error)).strip()
+    for variable in all_key_env_names():
+        secret = os.environ.get(variable, "")
+        if secret:
+            message = message.replace(secret, "[REDACTED]")
+    message = re.sub(r"(?i)bearer\s+[A-Za-z0-9._~-]{8,}", "Bearer [REDACTED]", message)
+    return message[:500] or error.__class__.__name__
 
 
 __all__ = [
@@ -604,8 +754,10 @@ __all__ = [
     "AIProvider",
     "AIProviderError",
     "AIProviderName",
+    "AIProviderRefusal",
     "AIProviderSettings",
-    "CustomOpenAICompatibleProvider",
+    "NEBIUS_TOKEN_FACTORY_BASE_URL",
+    "OpenAICompatibleProvider",
     "StructuredOutputRequest",
     "ToolDefinition",
     "create_ai_provider",

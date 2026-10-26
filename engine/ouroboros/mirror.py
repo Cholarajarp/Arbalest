@@ -1,6 +1,6 @@
 """The Mirror Sandbox — Arbalest executing a mutated copy of itself.
 
-The mutated organism is installed into a Nebius Token Factory Sandbox as an
+The mutated organism is installed into a verification sandbox as an
 import closure: mutated files + their local dependency closure + a
 ``sitecustomize`` compatibility layer (the sandbox's python:3.12-slim carries
 no third-party packages, so leaf SDKs are stubbed and pydantic is provided by
@@ -38,8 +38,7 @@ from unittest import mock
 # lazy stub, because the sandbox python:3.12-slim ships no third-party packages
 # and the battery never executes their internals.
 _STUB_ROOTS = frozenset({
-    "httpx", "openai", "docker", "chromadb", "sentence_transformers",
-    "neo4j", "firebase_admin", "jwt", "cryptography", "azure", "yaml",
+    "httpx", "openai", "docker", "neo4j", "yaml",
 })
 
 

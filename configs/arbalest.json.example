@@ -1,0 +1,13 @@
+{
+  "provider": "nebius",
+  "scan": {
+    "concurrency": 4,
+    "max_seconds": 900,
+    "max_model_calls": 40,
+    "per_call_model_calls": 3,
+    "call_timeout_seconds": 120,
+    "max_retries": 1,
+    "max_cost_usd": 5,
+    "per_call_reserve_usd": 0.25
+  }
+}

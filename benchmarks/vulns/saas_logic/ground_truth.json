@@ -1,0 +1,28 @@
+{
+ "classes": [
+  {
+   "id": "mass-assignment",
+   "keywords": [
+    "mass assignment",
+    "role"
+   ],
+   "layer": "agentic"
+  },
+  {
+   "id": "client-trusted-privilege",
+   "keywords": [
+    "is_admin",
+    "authorization"
+   ],
+   "layer": "agentic"
+  },
+  {
+   "id": "toctou-race",
+   "keywords": [
+    "race",
+    "toctou"
+   ],
+   "layer": "agentic"
+  }
+ ]
+}

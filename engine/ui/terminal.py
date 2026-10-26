@@ -51,7 +51,11 @@ class _C:
 
     @staticmethod
     def _rgb(hex_or_rgb: str) -> str:
-        return hex_or_rgb if "," in hex_or_rgb else "255,255,255"
+        # ANSI true-color SGR parameters are semicolon-separated. Palette
+        # constants use readable ``R,G,B`` notation, so normalize them before
+        # emitting an escape sequence. Commas made the terminal render color
+        # inconsistently and made ANSI-aware table widths drift.
+        return hex_or_rgb.replace(",", ";") if "," in hex_or_rgb else "255;255;255"
 
     def __call__(self, text: object, color: str | None = None, *, bold: bool = False,
                  dim: bool = False, reverse: bool = False) -> str:
@@ -173,11 +177,12 @@ def sev_rank(sev: str) -> int:
 
 
 LOGO = [
-    "██╗   ██╗ █████╗ ███╗   ██╗ ██████╗ ██╗   ██╗ █████╗ ██████╗ ██████╗ ",
-    "██║   ██║██╔══██╗████╗  ██║██╔════╝ ██║   ██║██╔══██╗██╔══██╗██╔══██╗",
-    "╚██╗ ██╔╝███████║██╔██╗ ██║██║  ███╗██║   ██║███████║██████╔╝██║  ██║",
-    " ╚████╔╝ ██╔══██║██║╚██╗██║██║   ██║██║   ██║██╔══██║██╔══██╗██║  ██║",
-    "  ╚═══╝  ╚═╝  ╚═╝╚═╝ ╚████╝╚██████╔╝╚██████╔╝██║  ██║██║  ██║██████╔╝",
+    " █████╗ ██████╗ ██████╗  █████╗ ██╗     ███████╗███████╗████████╗",
+    "██╔══██╗██╔══██╗██╔══██╗██╔══██╗██║     ██╔════╝██╔════╝╚══██╔══╝",
+    "███████║██████╔╝██████╔╝███████║██║     █████╗  ███████╗   ██║",
+    "██╔══██║██╔══██╗██╔══██╗██╔══██║██║     ██╔══╝  ╚════██║   ██║",
+    "██║  ██║██║  ██║██████╔╝██║  ██║███████╗███████╗███████║   ██║",
+    "╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝  ╚═╝╚══════╝╚══════╝╚══════╝   ╚═╝",
 ]
 
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -272,6 +277,22 @@ class Console:
         self._stream = stream or sys.stdout
         self.silent = silent
         self.meta = meta                # Meta-Mode: inverted scheme for self-evolution
+        # Windows console hosts vary in how they measure and render Unicode
+        # box glyphs. Use ASCII grids by default there so alignment stays
+        # correct in PowerShell, cmd, Windows Terminal, and IDE terminals.
+        # ARBALEST_UNICODE_TABLES=1 opts into Unicode grids; ARBALEST_ASCII=1
+        # forces the portable style on every platform.
+        unicode_override = (
+            os.environ.get("ARBALEST_UNICODE_TABLES", "").strip().lower() in {"1", "true", "yes"}
+        )
+        self.ascii_tables = (
+            os.environ.get("ARBALEST_ASCII", "").strip().lower() in {"1", "true", "yes"}
+            or (
+                self._stream is sys.stdout
+                and os.name == "nt"
+                and not unicode_override
+            )
+        )
         self.live = False
         self._last_rewrite_len = 0
         if not silent:
@@ -314,14 +335,14 @@ class Console:
         for row in LOGO:
             self.print(palette(row, NEON_ORANGE, bold=True))
         self.print(palette(
-            f"  DEVSECOPS STRIKE PLATFORM v{version} — SILENT ▸ PRECISE ▸ AUTONOMOUS",
+            f"  AGENTIC SOFTWARE SECURITY v{version} — ANALYZE ▸ REMEDIATE ▸ VERIFY",
             WHITE, bold=True,
         ))
         self.rule()
-        self.kv("OPERATOR", "TIER-1 INCIDENT RESPONSE", ELECTRIC_BLUE)
+        self.kv("MODE", "LOCAL-FIRST DEVSECOPS", ELECTRIC_BLUE)
         self.kv("TARGET", str(target))
         self.kv("AI CORE", f"{provider} / {model}", ELECTRIC_BLUE)
-        self.kv("NEBIUS TOKEN FACTORY SANDBOX", sandbox,
+        self.kv("SANDBOX", sandbox,
                 EMERALD if "ARMED" in sandbox else AMBER)
         self.rule()
 
@@ -367,7 +388,7 @@ class Console:
 
     def table(self, headers: Sequence[str], rows: Iterable[Sequence[str]],
               *, aligns: Sequence[str] | None = None, max_col: int = 42) -> None:
-        """Box-drawing data table. Vulnerability-centric, zero padding waste."""
+        """Data table with Unicode grids or an ASCII compatibility fallback."""
         aligns = list(aligns or ["<"] * len(headers))
         body = [list(r) for r in rows]
         widths = [visible_width(h) for h in headers]
@@ -385,22 +406,33 @@ class Console:
                 return " " * left + s + " " * (gap - left)
             return s + " " * gap
 
+        if self.ascii_tables:
+            top, middle, bottom = ("+", "+", "+"), ("+", "+", "+"), ("+", "+", "+")
+            horizontal = "-"
+            vertical = "|"
+        else:
+            top, middle, bottom = ("┌", "┬", "┐"), ("├", "┼", "┤"), ("└", "┴", "┘")
+            horizontal = "─"
+            vertical = "│"
+
         def _hline(left: str, mid: str, right: str) -> str:
-            segs = [palette("─" * (w + 2), DIM) for w in widths]
+            segs = [palette(horizontal * (w + 2), DIM) for w in widths]
             return left + mid.join(segs) + right
 
         if not body:
             self.line("  ─ no records ─", DIM)
             return
-        head_cells = [_fmt(palette(h.upper(), NEON_ORANGE, bold=True), widths[i], aligns[i])
-                      for i, h in enumerate(headers)]
-        self._out(_hline("┌", "┬", "┐") + "\n")
-        self._out("│ " + " │ ".join(head_cells) + " │\n")
-        self._out(_hline("├", "┼", "┤") + "\n")
+        # Keep headers unstyled. Some Windows PowerShell hosts intermittently
+        # lose ANSI-styled text that follows a table separator, leaving blank
+        # header cells even though the row data renders normally.
+        head_cells = [_fmt(h.upper(), widths[i], aligns[i]) for i, h in enumerate(headers)]
+        self._out(_hline(*top) + "\n")
+        self._out(vertical + " " + f" {vertical} ".join(head_cells) + f" {vertical}\n")
+        self._out(_hline(*middle) + "\n")
         for row in body:
             cells = [_fmt(str(c), widths[i], aligns[i]) for i, c in enumerate(row)]
-            self._out("│ " + " │ ".join(cells) + " │\n")
-        self._out(_hline("└", "┴", "┘") + "\n")
+            self._out(vertical + " " + f" {vertical} ".join(cells) + f" {vertical}\n")
+        self._out(_hline(*bottom) + "\n")
 
     # -- machinery ----------------------------------------------------------
     def status_line(self, text: str, *, end: bool = False) -> None:
@@ -425,12 +457,18 @@ class Console:
 
     # -- debrief -------------------------------------------------------------
     def verdict(self, counts: dict[str, int], total: int, exit_code: int,
-                report_path: str | None, elapsed: float) -> None:
+                report_path: str | None, elapsed: float, *,
+                headline: str | None = None, headline_color: str | None = None,
+                path_label: str = "SARIF REPORT") -> None:
+        """Final debrief. ``headline`` overrides the scan verdict for commands that
+        are not scans, so a proposed, unverified patch is never reported as SECURED."""
         self.rule()
         safe = total == 0
-        verdict_txt = "SECURED — NO ACTIONABLE THREATS" if safe else "VULNERABLE — REMEDIATION REQUIRED"
-        vcolor = EMERALD if safe else NEON_ORANGE
-        self.line("  FINAL DEBRIEF — BOOK A TRIAL CLASS AT arbalest.sh/trial", GRAY)
+        verdict_txt = headline or (
+            "SECURED — NO ACTIONABLE THREATS" if safe else "VULNERABLE — REMEDIATION REQUIRED"
+        )
+        vcolor = headline_color or (EMERALD if safe else NEON_ORANGE)
+        self.line("  FINAL DEBRIEF", GRAY)
         self.print()
         self.line(f"  VERDICT: {verdict_txt}", vcolor, bold=True)
         breakdown = "   ".join(
@@ -440,8 +478,13 @@ class Console:
         if breakdown:
             self.line(f"  {breakdown}", WHITE)
         if report_path:
-            self.kv("SARIF REPORT", report_path, ELECTRIC_BLUE)
+            self.kv(path_label, report_path, ELECTRIC_BLUE)
         self.kv("ELAPSED", f"{elapsed:.1f}s", GRAY)
+        exit_legend = (
+            "(0 = SECURED, 1 = VULNERABLE, 2 = MISSION ERROR)"
+            if headline is None
+            else "(0 = succeeded, 1 = findings/rejected, 2 = mission error)"
+        )
         self.line(f"  EXIT CODE: {palette(str(exit_code), vcolor, bold=True)}"
-                  f" {palette('(0 = SECURED, 1 = VULNERABLE)', DIM)}")
+                  f" {palette(exit_legend, DIM)}")
         self.rule()

@@ -1,0 +1,21 @@
+{
+  "_readme": [
+    "Optional operator-supplied emergency advisories. Copy to a path of your",
+    "choice and point ARBALEST_ADVISORIES_FILE at it. Entries merge by tag",
+    "over the built-in dated table (operator wins). Shape mirrors the built-in",
+    "table; malformed files are ignored with a warning and never fail a scan."
+  ],
+  "advisories": [
+    {
+      "tag": "example-nginx-2027-01",
+      "component": "nginx",
+      "published": "2027-01-15",
+      "ids": ["CVE-2027-00000"],
+      "floors": {"1.27": "1.27.5", "1.26": "1.26.3"},
+      "lines": ["1.26", "1.27"],
+      "all_below": "1.26",
+      "affected": "nginx 1.26/1.27 before the January 2027 security release (example entry)",
+      "url": "https://example.com/advisory"
+    }
+  ]
+}

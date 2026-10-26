@@ -1,4 +1,4 @@
-"""The Minimax Loop — adversarial war-gaming inside the Nebius Token Factory Sandbox.
+"""The Minimax Loop — adversarial war-gaming inside the verification sandbox.
 
 Architect and Red Team no longer run sequentially. Each iteration:
 
@@ -17,7 +17,6 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from engine.agents.architect_agent import (
-    ArchitectureGraphContext,
     ArchitectAgent,
     CodeLanguage,
     MutationPlan,
@@ -26,7 +25,8 @@ from engine.agents.architect_agent import (
 )
 from engine.agents.polyglot_translator import GeneratedCodeBundle, PolyglotTranslator
 from engine.agents.red_team_swarm import RedTeamResult, RedTeamSwarm
-from engine.services.docker_manager import DockerSandboxManager
+from engine.services.docker_manager import SandboxBackend
+from engine.services.source_graph import build_file_graph
 
 logger = logging.getLogger("arbalest.wargame")
 
@@ -55,7 +55,7 @@ class WargameIteration:
 
 @dataclass
 class WargameResult:
-    resolved: bool                          # final patch survived the swarm
+    resolved: bool = False                  # final patch survived the swarm
     iterations: list[WargameIteration] = field(default_factory=list)
     final_bundle: GeneratedCodeBundle | None = None
     final_plan: MutationPlan | None = None
@@ -71,7 +71,7 @@ class WargameEngine:
         self,
         *,
         provider,
-        sandbox: DockerSandboxManager,
+        sandbox: SandboxBackend,
         max_iterations: int = 4,
         left_log: LogLine | None = None,
         right_log: LogLine | None = None,
@@ -94,7 +94,7 @@ class WargameEngine:
             if iteration == 1:
                 self._left(f"iter {iteration}: ARCHITECT-01 drafting mutation plan for {finding.cwe}")
                 plan = await architect.create_plan(
-                    graph_context=ArchitectureGraphContext(project_id="immune-wargame", nodes=[], edges=[]),
+                    graph_context=build_file_graph("immune-wargame", sources, prioritize=finding.affected_nodes),
                     findings=[finding],
                     developer_task=(
                         f"Eradicate {finding.cwe} ({finding.summary[:200]}) proven reachable from the "
@@ -152,6 +152,19 @@ class WargameEngine:
                 self._right(f"iter {iteration}: ✗ BREACH FAILED — patch held ({record.sandbox_status})")
                 result.iterations.append(record)
                 result.resolved = True
+                return result
+
+            if red_team_result.verification_held:
+                # The patch held, but only against a signature probe or a
+                # low-confidence verdict. Repairing a patch that was not
+                # breached is meaningless, and this evidence is below the
+                # certification bar, so stop without certifying.
+                record.verdict = (
+                    f"PATCH HELD — {red_team_result.verification_tier} evidence only; certification blocked"
+                )
+                self._right(f"iter {iteration}: ✗ BREACH FAILED — patch held, but evidence is "
+                            f"{red_team_result.verification_tier}; not certified")
+                result.iterations.append(record)
                 return result
 
             if red_team_result.analysis.inconclusive:

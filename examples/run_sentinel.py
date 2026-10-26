@@ -1,46 +1,55 @@
-"""Example of using Sentinel Agent to ingest a WAF log and trigger Arbalest."""
+"""Run the experimental Sentinel traffic-event analyzer with the configured provider.
+
+This example uses synthetic data only. Sentinel is not part of the default
+`arbalest scan` command; it demonstrates the current standalone agent API.
+"""
+
+from __future__ import annotations
 
 import asyncio
-import os
-from engine.agents.sentinel_agent import TrafficEvent, SentinelAgent
-from engine.services.ai_provider import CustomOpenAICompatibleProvider, AIProviderSettings
+import sys
+from pathlib import Path
 
-async def main():
-    # 1. Simulate a malicious payload hitting your live SaaS API
-    # This could be piped directly from an AWS WAF, Cloudflare Logpush, or Nginx access.log
-    malicious_event = TrafficEvent(
-        source_ip="198.51.100.23",
-        method="POST",
-        path="/api/v1/user/update_profile",
-        headers={"User-Agent": "Mozilla/5.0", "Content-Type": "application/json"},
-        body='{"username": "admin", "bio": "test", "role": "admin"}' # Mass Assignment / IDOR attempt
-    )
-    
-    # 2. Initialize the Sentinel Agent with your enterprise custom AI provider
-    settings = AIProviderSettings(
-        provider="meta",
-        api_key=os.environ.get("AI_API_KEY", "dummy-key-123"),
-        selected_model="meta/llama-3.1-70b-instruct"
-    )
-    provider = CustomOpenAICompatibleProvider(settings=settings)
-    sentinel = SentinelAgent(provider=provider)
-    
-    print(f"[*] Sentinel Agent initialized: {sentinel.__class__.__name__}. Monitoring live traffic...")
-    print(f"[*] Intercepted payload from {malicious_event.source_ip} on {malicious_event.path}")
-    
-    # 3. If running in a real environment, you would pass this event into run_pipeline
-    # which we updated in arbalest_master_loop.py to ingest traffic_events directly.
-    print("[*] Forwarding to Arbalest Orchestrator to generate an emergency hotfix...")
-    
-    # Example pseudo-code for calling the orchestrator:
-    # async for event in run_pipeline(
-    #     target_url="https://production-saas.internal",
-    #     engagement_id="RASP-HOTFIX-001",
-    #     sentinel_agent=sentinel,
-    #     traffic_events=[malicious_event],
-    #     ...
-    # ):
-    #     print(event)
+_REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
+if str(_REPOSITORY_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPOSITORY_ROOT))
+
+from engine.agents.architect_agent import ArchitectureGraphContext, ArchitectureNode  # noqa: E402
+from engine.agents.sentinel_agent import SentinelAgent, TrafficEvent  # noqa: E402
+from engine.services.runtime import build_provider, load_env_file  # noqa: E402
+
+
+async def main() -> None:
+    repository_root = _REPOSITORY_ROOT
+    load_env_file((repository_root, Path.cwd()))
+    provider, provider_name, model = build_provider(None, None)
+    try:
+        event = TrafficEvent(
+            source_ip="198.51.100.23",  # RFC 5737 documentation address
+            method="GET",
+            path="/api/v1/users",
+            headers={"User-Agent": "Arbalest-Synthetic-Sentinel-Demo/1.0"},
+            body='{"search": "\' OR 1=1 --"}',
+            timestamp="2026-01-01T00:00:00Z",
+        )
+        graph = ArchitectureGraphContext(
+            project_id="sentinel-example",
+            nodes=[ArchitectureNode(
+                id="route:users",
+                labels=["Route"],
+                properties={"path": "/api/v1/users", "method": "GET", "framework": "synthetic"},
+            )],
+            edges=[],
+        )
+        finding = await SentinelAgent(provider).analyze_traffic(event, graph)
+        print(f"provider={provider_name} model={model}")
+        if finding is None:
+            print("verdict=not-malicious")
+        else:
+            print(finding.model_dump_json(indent=2))
+    finally:
+        await provider.aclose()
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -1,0 +1,27 @@
+[mcp_servers.arbalest]
+command = "arbalest-mcp"
+args = []
+cwd = "C:/path/to/Arbalest"
+env_vars = [
+  "ARBALEST_PROVIDER",
+  "ARBALEST_MODEL",
+  "ARBALEST_MCP_ALLOWED_ROOTS",
+  "NEBIUS_API_KEY",
+  "NEBIUS_PROJECT_ID",
+  "OPENAI_API_KEY",
+  "ANTHROPIC_API_KEY",
+  "GEMINI_API_KEY",
+  "MISTRAL_API_KEY",
+  "DEEPSEEK_API_KEY",
+  "XAI_API_KEY",
+  "OPENROUTER_API_KEY",
+  "AI_API_KEY",
+  "AI_BASE_URL",
+  "ARBALEST_PROVIDERS_FILE",
+]
+# Host-agent tools (prepare/submit/verify_remediation_candidate) need no key:
+# Codex's own model does the reasoning and Arbalest validates and verifies.
+startup_timeout_sec = 20
+tool_timeout_sec = 900
+required = true
+default_tools_approval_mode = "prompt"

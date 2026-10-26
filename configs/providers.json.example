@@ -1,0 +1,24 @@
+{
+  "providers": {
+    "corp-gateway": {
+      "display_name": "Corporate LLM gateway",
+      "protocol": "openai_chat",
+      "api_url": "https://llm.corp.example/v1",
+      "default_model": "corp-large"
+    },
+    "vllm-local": {
+      "display_name": "vLLM on this workstation",
+      "protocol": "openai_chat",
+      "api_url": "http://127.0.0.1:8000/v1",
+      "key_optional": true
+    },
+    "responses-proxy": {
+      "protocol": "openai_responses",
+      "api_url": "https://proxy.example/v1"
+    },
+    "claude-gateway": {
+      "protocol": "anthropic",
+      "api_url": "https://anthropic-proxy.example/v1"
+    }
+  }
+}

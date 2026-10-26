@@ -1,0 +1,8 @@
+# Keep source diffs stable across Windows, macOS, and Linux.
+* text=auto eol=lf
+.gitignore text eol=lf diff
+
+# Windows command scripts must retain CRLF line endings.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf

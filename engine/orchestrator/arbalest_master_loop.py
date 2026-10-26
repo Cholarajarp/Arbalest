@@ -1,4 +1,7 @@
-"""Streaming six-phase Arbalest remediation orchestrator."""
+"""Experimental composable six-phase remediation orchestrator.
+
+This research API is not invoked by the supported CLI or MCP entry points.
+"""
 
 from __future__ import annotations
 
@@ -29,7 +32,6 @@ from engine.agents.sast_agent import SastAgent
 from engine.agents.secret_scanner import SecretScannerAgent
 from engine.agents.semgrep_agent import SemgrepAgent
 from engine.agents.sentinel_agent import SentinelAgent, TrafficEvent
-from engine.agents.osint_recon_agent import OsintReconAgent
 from engine.services.graph_manager import FunctionNode, GraphManager, RouteNode
 
 logger = logging.getLogger(__name__)
@@ -90,7 +92,6 @@ async def run_pipeline(
     secret_scanner: SecretScannerAgent | None = None,
     semgrep_agent: SemgrepAgent | None = None,
     sentinel_agent: SentinelAgent | None = None,
-    osint_agent: OsintReconAgent | None = None,
     traffic_events: list[TrafficEvent] | None = None,
     immune_system: ImmuneSystemSynthesizer | None = None,
     target_language: CodeLanguage = CodeLanguage.AUTO,
@@ -228,16 +229,6 @@ async def run_pipeline(
             except Exception as sec_err:
                 logger.warning("Secret Scanner analysis failed", extra={"error": str(sec_err)[:300]})
 
-        if osint_agent is not None:
-            yield _event(current_run_id, 3, "agent_log", "Running OSINT Recon Agent to map external attack surface...", {"agent": "osint_recon_agent"})
-            try:
-                osint_findings = await osint_agent.analyze_target(target_url)
-                findings.extend(osint_findings)
-                if osint_findings:
-                    yield _event(current_run_id, 3, "agent_log", f"OSINT Recon discovered {len(osint_findings)} external infrastructure exposures.", {"agent": "osint_recon_agent", "finding_count": len(osint_findings)})
-            except Exception as osint_err:
-                logger.warning("OSINT Recon failed", extra={"error": str(osint_err)[:300]})
-                
         if sentinel_agent is not None and traffic_events:
             yield _event(current_run_id, 3, "agent_log", f"Running Sentinel Agent on {len(traffic_events)} live traffic events...", {"agent": "sentinel_agent"})
             try:
@@ -245,7 +236,7 @@ async def run_pipeline(
                     sentinel_finding = await sentinel_agent.analyze_traffic(event, graph_context)
                     if sentinel_finding:
                         findings.append(sentinel_finding)
-                        yield _event(current_run_id, 3, "agent_log", f"Sentinel Agent flagged live attack: {sentinel_finding.threat_type}", {"agent": "sentinel_agent"})
+                        yield _event(current_run_id, 3, "agent_log", f"Sentinel Agent flagged authorized traffic event: {sentinel_finding.cwe}", {"agent": "sentinel_agent"})
             except Exception as sent_err:
                 logger.warning("Sentinel Agent analysis failed", extra={"error": str(sent_err)[:300]})
 
@@ -556,15 +547,18 @@ async def run_pipeline(
                     {"agent": "red_team", "error": str(rt_err)[:500]},
                 )
 
-        yield _event(current_run_id, 6, "phase_started", "Evaluating deployment gate")
+        yield _event(current_run_id, 6, "phase_started", "Evaluating verification gate")
         if red_team_result is not None and red_team_result.deployment_allowed:
-            deployment_url = f"https://deployments.invalid/arbalest/{current_run_id}"
             yield _event(
                 current_run_id,
                 6,
-                "deployment_ready",
-                "Sandbox gate passed; generated deployment URL is a non-production placeholder",
-                {"deployment_url": deployment_url, "mock": True},
+                "verification_passed",
+                "Sandbox gate passed; the caller may persist a remediation artifact for reviewed deployment",
+                {
+                    "finding_count": len(findings),
+                    "generated_files": len(generated_code.files) if generated_code is not None else 0,
+                    "plan_id": mutation_plan.plan_id if mutation_plan is not None else "",
+                },
             )
         else:
             reason = "no mutation was produced" if generated_code is None else (
@@ -573,10 +567,9 @@ async def run_pipeline(
             yield _event(
                 current_run_id,
                 6,
-                "deployment_blocked",
-                f"Deployment withheld because {reason}",
+                "verification_blocked",
+                f"Verification withheld because {reason}",
                 {
-                    "mock": True,
                     "finding_count": len(findings),
                     "code_generated": generated_code is not None,
                     "red_team_completed": red_team_result is not None,

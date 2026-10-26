@@ -1,0 +1,83 @@
+{
+ "classes": [
+  {
+   "id": "php-webshell-exec",
+   "keywords": [
+    "webshell",
+    "request"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "php-unserialize",
+   "keywords": [
+    "deserialization",
+    "request"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "php-file-inclusion",
+   "keywords": [
+    "inclusion",
+    "request"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "php-sql",
+   "keywords": [
+    "sql",
+    "request"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "node-exec-concat",
+   "keywords": [
+    "exec",
+    "concatenation"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "go-shell",
+   "keywords": [
+    "shell",
+    "interpreter"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "ruby-shell",
+   "keywords": [
+    "shell",
+    "interpolation"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "ruby-marshal",
+   "keywords": [
+    "marshal"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "java-exec",
+   "keywords": [
+    "runtime",
+    "execution"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "java-readobject",
+   "keywords": [
+    "readobject",
+    "deserialization"
+   ],
+   "layer": "deterministic"
+  }
+ ]
+}

@@ -24,8 +24,12 @@ from engine.immune.detection import DetectionFinding, sweep_sources
 from engine.immune.topology import BlastRadius, TopologyMapper
 from engine.immune.wargame import WargameEngine, WargameResult, finding_from_detection
 from engine.services.graph_manager import GraphManager
+from engine.services.ai_provider import AIProvider
+from engine.services.docker_manager import SandboxBackend
 from engine.services.source_collector import run_recon
+from engine.services.remediation_artifact import atomic_apply_mapping
 from engine.ui.terminal import (
+    AMBER,
     BLOOD_RED,
     ELECTRIC_PURPLE,
     EMERALD,
@@ -42,8 +46,8 @@ EXIT_IMMUNE = 0
 EXIT_VULNERABLE = 1
 EXIT_MISSION_ERROR = 2
 
-ProviderFactory = Callable[[], object]
-SandboxFactory = Callable[[], object]
+ProviderFactory = Callable[[], AIProvider]
+SandboxFactory = Callable[[], SandboxBackend]
 
 
 @dataclass
@@ -68,6 +72,7 @@ async def run_immune_mission(
     max_iterations: int = 4,
     max_findings: int = 3,
     use_sandbox: bool = True,
+    deploy: bool = False,
 ) -> int:
     """Execute the Immune System mission and return the exit code."""
     t0 = time.perf_counter()
@@ -135,6 +140,11 @@ async def run_immune_mission(
     for mission_target in targets:
         _render_trace(console, mission_target)
 
+    if not use_sandbox:
+        console.note("analysis-only mode: sandbox verification was disabled; no patch, antibody, or deployment is permitted")
+        console.verdict({}, len(targets), EXIT_VULNERABLE, None, time.perf_counter() - t0)
+        return EXIT_VULNERABLE
+
     # ── Arm the AI core (real) ────────────────────────────────────────────
     try:
         provider = provider_factory()
@@ -146,16 +156,17 @@ async def run_immune_mission(
         return EXIT_MISSION_ERROR
 
     sandbox = sandbox_factory()
-    if use_sandbox:
-        try:
-            with console.spinner("CRUCIBLE — negotiating with the Nebius Token Factory Sandbox"):
-                await sandbox.healthcheck()
-            console.success("Nebius Token Factory Sandbox — ranges hot.")
-        except Exception as exc:  # noqa: BLE001
-            console.error(f"Nebius Token Factory Sandbox unreachable: {exc}")
-            console.line("  The Crucible refuses to certify a patch it never burned. No verification, no deployment.",
-                         BLOOD_RED)
-            return EXIT_MISSION_ERROR
+    try:
+        with console.spinner("CRUCIBLE — negotiating with the verification sandbox"):
+            await sandbox.healthcheck()
+        console.success("Verification sandbox — ranges hot.")
+    except Exception as exc:  # noqa: BLE001
+        await sandbox.aclose()
+        await provider.aclose()
+        console.error(f"Verification sandbox unreachable: {exc}")
+        console.line("  The Crucible refuses to certify a patch it never burned. No verification, no deployment.",
+                     BLOOD_RED)
+        return EXIT_MISSION_ERROR
 
     # ── [2/3] WARGAME ─────────────────────────────────────────────────────
     console.phase(2, 3, "ADVERSARIAL WAR-GAMING (MINIMAX LOOP)", "⚔️")
@@ -170,13 +181,13 @@ async def run_immune_mission(
         )
         readout.open(f"Iteration: ARCHITECT-01 vs REDTEAM-SWARM — {mission_target.finding.cwe} @ {mission_target.finding.file}")
         try:
-            wargame = await engine.run(recon.files, tf)
+            game_result = await engine.run(recon.files, tf)
         except Exception as exc:  # noqa: BLE001 — war-game failure is per-target, not fatal
             console.error(f"WARGAME ABORTED for {mission_target.finding.rule_id}: {exc}")
             mission_target.wargame = WargameResult(resolved=False)
         else:
-            mission_target.wargame = wargame
-            if wargame.resolved:
+            mission_target.wargame = game_result
+            if game_result.resolved:
                 _render_resolution(console, mission_target)
         finally:
             await readout.close()
@@ -201,17 +212,33 @@ async def run_immune_mission(
         console.line(f"  🧬 {antibody.rule_id}", EMERALD, bold=True)
         console.kv("SELF-TEST", antibody.validation_detail,
                    EMERALD if antibody.validated else NEON_ORANGE)
+        if not antibody.validated:
+            console.note("unvalidated antibody was not persisted or broadcast")
+            continue
         lab.registry.save(antibody)
         console.kv("MEMORY", antibody.path, GRAY)
-        await _learn_graph_pattern(console, target, wargame, recon.files.get(mission_target.finding.file, ""),
-                                   mission_target.finding)
+        await _learn_graph_pattern(
+            console, target, wargame, recon.files.get(mission_target.finding.file, ""),
+            mission_target.finding, provider,
+        )
 
-    # ── Deploy surviving patches (real writes, real diffs) ────────────────
+    # ── Deploy surviving patches ──────────────────────────────────────────
+    # Source writes are opt-in (--deploy), mirroring `verify --apply`: by
+    # default verified bundles are staged as reviewable patches under
+    # .arbalest/proposed-heals and the working tree is never touched.
     deployed = 0
     for mission_target in targets:
         wargame = mission_target.wargame
         if wargame and wargame.resolved and wargame.final_bundle:
-            deployed += _deploy(console, target, mission_target)
+            if deploy:
+                deployed += _deploy(console, target, mission_target)
+            else:
+                _stage_heal(console, target, mission_target)
+    if not deploy:
+        console.note(
+            "dry-run — verified bundles staged under .arbalest/proposed-heals; "
+            "rerun with --deploy to write them into the working tree"
+        )
 
     # ── FINAL DEBRIEF ─────────────────────────────────────────────────────
     console.section("FINAL DEBRIEF — IMMUNE RESPONSE RECORD")
@@ -234,6 +261,8 @@ async def run_immune_mission(
             key = t.finding.severity
             counts[key] = counts.get(key, 0) + 1
     exit_code = EXIT_IMMUNE if resolved == len(targets) else EXIT_VULNERABLE
+    await sandbox.aclose()
+    await provider.aclose()
     console.verdict(counts, len(targets) - resolved, exit_code, None, time.perf_counter() - t0)
     return exit_code
 
@@ -263,7 +292,7 @@ def _render_trace(console: Console, t: MissionTarget) -> None:
         console.kv("INTERNAL ROOTS", "; ".join(radius.roots[:3]), GRAY)
 
 
-def _new_readout(console: Console, t: MissionTarget) -> object:
+def _new_readout(console: Console, t: MissionTarget):
     from engine.immune.readout import WargameReadout
 
     title = f"Iteration: ARCHITECT-01 vs REDTEAM-SWARM — {t.finding.cwe} @ {t.finding.file}"
@@ -282,27 +311,53 @@ def _render_resolution(console: Console, t: MissionTarget) -> None:
 
 
 def _deploy(console: Console, target: Path, t: MissionTarget) -> int:
-    """Write the surviving bundle into the organism (guarded to the root)."""
+    """Transactionally deploy one conclusively verified bundle."""
     wargame = t.wargame
-    assert wargame is not None and wargame.final_bundle is not None
+    if wargame is None or not wargame.resolved or wargame.final_bundle is None:
+        return 0
+    mapping = wargame.final_bundle.file_mapping()
     root = target.resolve()
-    written = 0
-    for generated in wargame.final_bundle.files:
-        dest = (root / generated.path).resolve()
-        if not dest.is_relative_to(root):
-            console.note(f"refusing out-of-tree path from bundle: {generated.path}")
-            continue
-        original = recon_read(root, generated.path)
-        if original is not None and original != generated.content:
-            for line in _diff_lines(original, generated.content, generated.path):
+    for relative, content in mapping.items():
+        original = recon_read(root, relative)
+        if original is not None and original != content:
+            for line in _diff_lines(original, content, relative):
                 console.line(line)
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(generated.content, encoding="utf-8")
-        t.applied_files.append(generated.path)
-        written += 1
-    if written:
-        console.success(f"deployed {written} healed file(s) into the organism")
-    return written
+    try:
+        atomic_apply_mapping(root, mapping)
+    except (OSError, ValueError) as exc:
+        console.error(f"transactional deployment failed: {exc}")
+        return 0
+    t.applied_files.extend(mapping)
+    console.success(f"deployed {len(mapping)} healed file(s) into the organism")
+    return len(mapping)
+
+
+def _stage_heal(console: Console, target: Path, t: MissionTarget) -> None:
+    """Write a conclusively verified bundle as a reviewable patch; source untouched."""
+    wargame = t.wargame
+    if wargame is None or not wargame.resolved or wargame.final_bundle is None:
+        return
+    root = target.resolve()
+    sections: list[str] = []
+    for relative, content in wargame.final_bundle.file_mapping().items():
+        original = recon_read(root, relative)
+        if original is None or original == content:
+            continue
+        sections.extend(difflib.unified_diff(
+            original.splitlines(), content.splitlines(),
+            fromfile=f"a/{relative}", tofile=f"b/{relative} (VERIFIED HEAL)", lineterm="", n=3,
+        ))
+    if not sections:
+        return
+    directory = root / ".arbalest" / "proposed-heals"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / f"{t.finding.rule_id}.patch"
+        path.write_text("\n".join(sections) + "\n", encoding="utf-8")
+    except OSError as exc:
+        console.error(f"staging verified heal failed: {exc}")
+        return
+    console.kv("STAGED HEAL", str(path), AMBER)
 
 
 def recon_read(root: Path, rel: str) -> str | None:
@@ -328,7 +383,12 @@ def _diff_lines(original: str, updated: str, rel: str) -> list[str]:
 
 
 async def _learn_graph_pattern(
-    console: Console, target: Path, wargame: WargameResult, original_code: str, finding: DetectionFinding
+    console: Console,
+    target: Path,
+    wargame: WargameResult,
+    original_code: str,
+    finding: DetectionFinding,
+    provider: AIProvider,
 ) -> None:
     """Optional Neo4j graph memory via the real ImmuneSystemAgent."""
     breach: RedTeamResult | None = wargame.last_breach
@@ -336,10 +396,6 @@ async def _learn_graph_pattern(
         return
     if not _graph_configured():
         console.kv("GRAPH MEMORY", "offline — local antibody registry is the source of truth", GRAY)
-        return
-    provider, _model = provider_for_graph()
-    if provider is None:
-        console.kv("GRAPH MEMORY", "offline — no AI core for pattern synthesis", GRAY)
         return
     graph = GraphManager()
     try:
@@ -362,20 +418,3 @@ def _graph_configured() -> bool:
     import os
 
     return bool(os.environ.get("NEO4J_URI"))
-
-
-def provider_for_graph():
-    """Best-effort real provider for graph-memory synthesis; None when unarmed."""
-    import os
-
-    from engine.services.ai_provider import AIProviderSettings, create_ai_provider
-
-    key = os.environ.get("AI_API_KEY", "").strip()
-    if not key:
-        return None, ""
-    settings = AIProviderSettings(provider=os.environ.get("ARBALEST_PROVIDER", "custom"),
-                                  api_key=key, selected_model=os.environ.get("ARBALEST_MODEL"))
-    try:
-        return create_ai_provider(settings), settings.selected_model
-    except Exception:  # noqa: BLE001
-        return None, ""

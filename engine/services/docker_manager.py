@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 import docker
 from docker.errors import APIError, DockerException, ImageNotFound, NotFound
@@ -166,6 +166,22 @@ class SandboxResult:
     @property
     def succeeded(self) -> bool:
         return self.status is SandboxStatus.COMPLETED and self.exit_code == 0
+
+
+@runtime_checkable
+class SandboxBackend(Protocol):
+    """What the missions need from a verification sandbox.
+
+    Implemented by :class:`DockerSandboxManager` (local Docker) and by
+    ``NebiusSandboxManager`` (Nebius Token Factory Sandboxes). Callers depend on
+    this shape only, so the backend can be swapped without touching any agent.
+    """
+
+    async def run(self, spec: SandboxRunSpec, *, log_sink: LogSink | None = None) -> SandboxResult: ...
+
+    async def healthcheck(self) -> None: ...
+
+    async def aclose(self) -> None: ...
 
 
 class DockerSandboxManager:
@@ -528,7 +544,8 @@ async def _stream_live_logs(container: Any, sink: LogSink) -> None:
             if item is None:
                 return
             stream, payload = item
-            emitted = sink(stream, payload.decode("utf-8", errors="replace"))
+            safe_payload = sanitize_for_terminal(payload.decode("utf-8", errors="replace"))
+            emitted = sink(stream, safe_payload)
             if inspect.isawaitable(emitted):
                 await emitted
     finally:

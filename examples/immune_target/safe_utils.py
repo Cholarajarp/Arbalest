@@ -1,7 +1,6 @@
 """Fixture organism — clean tissue; the sweep must stay silent here."""
 import ast
 import hashlib
-import json
 import subprocess
 
 

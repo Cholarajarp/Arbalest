@@ -391,7 +391,8 @@ class TopologyMapper:
         return list(reversed(path))
 
     def _downstream(self, start: str) -> list[str]:
-        seen, queue = [], deque([start])
+        seen: list[str] = []
+        queue = deque([start])
         visited = {start}
         while queue and len(seen) < MAX_DOWNSTREAM:
             current = queue.popleft()

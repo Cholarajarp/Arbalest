@@ -1,11 +1,5 @@
-"""AI agents used by the Arbalest orchestration pipeline."""
+"""Agent interfaces used by supported and experimental Arbalest workflows."""
 
-from .sentinel_agent import SentinelAgent, TrafficEvent, SentinelFinding
-from .osint_recon_agent import OsintReconAgent
+from .sentinel_agent import SentinelAgent, SentinelFinding, TrafficEvent
 
-__all__ = [
-    "SentinelAgent",
-    "TrafficEvent",
-    "SentinelFinding",
-    "OsintReconAgent",
-]
+__all__ = ["SentinelAgent", "SentinelFinding", "TrafficEvent"]

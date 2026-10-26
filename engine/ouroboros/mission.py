@@ -24,7 +24,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from engine.agents.architect_agent import (
-    ArchitectureGraphContext,
     ArchitectAgent,
     CodeLanguage,
     MutationPlan,
@@ -36,6 +35,7 @@ from engine.agents.red_team_swarm import RedTeamSwarm
 from engine.hive.federation import FleetTopology
 from engine.hive.gitops import FleetGitOps
 from engine.immune.detection import sweep_sources
+from engine.immune.wargame import finding_from_detection
 from engine.ouroboros.mirror import (
     BATTERY_SEEDS,
     MARKER_PASSED,
@@ -44,7 +44,9 @@ from engine.ouroboros.mirror import (
 )
 from engine.ouroboros.metacognitive import MetacognitiveAgent
 from engine.services.ai_provider import StructuredOutputRequest
+from engine.services.remediation_artifact import atomic_apply_mapping
 from engine.services.docker_manager import SandboxRunSpec, SandboxRuntime
+from engine.services.source_graph import build_file_graph
 from engine.ui.terminal import (
     ELECTRIC_GOLD,
     GRAY,
@@ -228,7 +230,9 @@ async def run_evolution_mission(
     try:
         with console.spinner("META-ARCHITECT — drafting the self-modification plan"):
             plan: MutationPlan = await architect.create_plan(
-                graph_context=ArchitectureGraphContext(project_id="ouroboros", nodes=[], edges=[]),
+                graph_context=build_file_graph(
+                    "ouroboros", {path: sources[path] for path in closure if path in sources}, prioritize=seeds
+                ),
                 findings=[capability_finding],
                 developer_task=(
                     f"Implement this capability in Arbalest itself: {request.summary}. "
@@ -299,12 +303,14 @@ async def run_evolution_mission(
     sandbox = sandbox_factory()
     if use_sandbox:
         try:
-            with console.spinner("MIRROR BOOT — negotiating with the Nebius Token Factory Sandbox"):
+            with console.spinner("MIRROR BOOT — negotiating with the verification sandbox"):
                 await sandbox.healthcheck()
             console.line("  [OUROBOROS] 🪞 Recursive Sandbox Boot — installing the mutated organism...",
                          STARK_WHITE, bold=True)
         except Exception as exc:  # noqa: BLE001
-            console.error(f"Nebius Token Factory Sandbox unreachable: {exc}")
+            await sandbox.aclose()
+            await provider.aclose()
+            console.error(f"Verification sandbox unreachable: {exc}")
             console.line("  The mirror refuses to certify what it never ran. Organism unchanged.", ELECTRIC_GOLD)
             return EXIT_REJECTED
 
@@ -344,7 +350,10 @@ async def run_evolution_mission(
         with console.spinner("REDTEAM-SWARM — attacking Arbalest's own new surface"):
             red_team = RedTeamSwarm(sandbox=sandbox, provider=provider)
             mutated_findings = sweep_sources(bundle.file_mapping())
-            findings = [capability_finding, *mutated_findings[:5]]
+            findings: list[ThreatFinding] = [
+                capability_finding,
+                *(finding_from_detection(item) for item in mutated_findings[:5]),
+            ]
             red_team_result = await red_team.execute(
                 generated_code=bundle, mutation_plan=plan, findings=findings,
             )
@@ -357,6 +366,8 @@ async def run_evolution_mission(
     else:
         console.note("--no-sandbox: mirror proof skipped; patches can NOT be certified")
         outcome = EvolutionOutcome(targets=list(bundle.file_mapping()), mutation_hash=decision.mutation_hash)
+        await sandbox.aclose()
+        await provider.aclose()
         return EXIT_REJECTED
 
     # ── [4/4] AUTO-EVOLUTION ──────────────────────────────────────────────
@@ -377,6 +388,7 @@ async def run_evolution_mission(
                 summary=f"Self-evolution generation {agent.state.generation + 1}: {request.summary}",
                 evidence=[f"mirror proof: {MARKER_PASSED}", f"mutation hash: {outcome.mutation_hash}"],
                 branch_prefix="arbalest/evolve",
+                content_by_path=bundle.file_mapping(),
             )
             outcome.committed = pr.ok
             outcome.branch = pr.branch
@@ -390,11 +402,12 @@ async def run_evolution_mission(
             console.error(f"self-commit failed: {exc}")
             return EXIT_REJECTED
     else:
-        for path, content in bundle.file_mapping().items():
-            dest = (self_root / path).resolve()
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(content, encoding="utf-8")
-        console.note("gitops disabled — mutated files written to the working tree")
+        try:
+            atomic_apply_mapping(self_root, bundle.file_mapping())
+        except (OSError, ValueError) as exc:
+            console.error(f"atomic self-deployment failed: {exc}")
+            return EXIT_REJECTED
+        console.note("gitops disabled — exact verified bytes written transactionally to the working tree")
 
     outcome.generation = agent.record_commit(outcome.mutation_hash, request.summary, outcome.targets)
     console.rule()
@@ -404,6 +417,8 @@ async def run_evolution_mission(
         MATRIX_GREEN, bold=True,
     )
     console.kv("ELAPSED", f"{time.perf_counter() - t0:.1f}s", GRAY)
+    await sandbox.aclose()
+    await provider.aclose()
     console.line(f"  EXIT CODE: {palette('0', MATRIX_GREEN, bold=True)} (0 = EVOLVED, 1 = REJECTED, 2 = ERROR)")
     console.rule()
     return EXIT_EVOLVED

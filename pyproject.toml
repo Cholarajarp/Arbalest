@@ -1,20 +1,40 @@
+[build-system]
+requires = ["setuptools==80.9.0"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "arbalest"
-version = "0.1.0"
+version = "1.0.0"
 description = "Autonomous DevSecOps AI Scanner and Swarm Defense"
+authors = [{ name = "Cholaraja R P" }]
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.12"
 dependencies = [
-    "pydantic>=2.0.0",
-    "openai>=1.0.0",
-    "neo4j>=5.0.0",
-    "docker>=7.0.0",
-    "httpx>=0.24.0",
-    "chromadb>=0.4.0",
+    "pydantic==2.13.4",
+    "openai==2.45.0",
+    "neo4j==6.2.0",
+    "docker==7.2.0",
+    "httpx==0.28.1",
+    "PyYAML==6.0.3",
+]
+
+[dependency-groups]
+# Keep local checks and CI reproducible with `uv sync --group dev`.
+# requirements-dev.txt mirrors this group for contributors using plain pip.
+dev = [
+    "bandit==1.9.4",
+    "mypy==2.3.0",
+    "pip-audit==2.10.1",
+    "pytest==9.1.1",
+    "pytest-asyncio==1.4.0",
+    "ruff==0.15.21",
 ]
 
 [project.scripts]
 arbalest = "arbalest_cli:main"
+arbalest-mcp = "mcp_server:run"
 
 [tool.ruff]
 target-version = "py312"
@@ -28,7 +48,7 @@ select = ["E4", "E7", "E9", "F"]
 
 [tool.mypy]
 python_version = "3.12"
-files = ["engine", "tests"]
+files = ["engine", "arbalest_cli.py", "mcp_server.py"]
 follow_imports = "skip"
 ignore_missing_imports = true
 check_untyped_defs = true
@@ -45,3 +65,9 @@ filterwarnings = [
   # targets Python 3.12, where the API is not deprecated.
   "ignore:.*event_loop_policy.*:DeprecationWarning:pytest_asyncio.plugin",
 ]
+
+[tool.setuptools]
+py-modules = ["arbalest_cli", "mcp_server"]
+
+[tool.setuptools.packages.find]
+include = ["engine", "engine.*"]

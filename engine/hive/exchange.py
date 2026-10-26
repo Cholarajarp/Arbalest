@@ -49,7 +49,7 @@ class FleetPatternExchange:
     ) -> BroadcastReceipt:
         """Persist a learned pattern globally and fan out to reachable graphs."""
         pattern_id = f"pattern-{uuid.uuid4().hex[:10]}"
-        record = {
+        record: dict[str, object] = {
             "pattern_id": pattern_id,
             "threat_name": threat_name,
             "cwe_category": cwe_category,

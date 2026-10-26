@@ -1,11 +1,10 @@
-"""Deny-by-default policy gate for agent-generated actions.
+"""Fail-closed deny-rule policy gate for agent-generated actions.
 
-Agents produce commands and file artifacts. The gateway is the single choke
-point every such artifact passes before execution: privilege escalation,
-container/VM escape, network egress, destructive filesystem operations,
-supply-chain installs, and host-secret access are denied with a named rule;
-everything else is allowed. Deny rules are fail-closed — an evaluation error
-is a denial.
+Agents produce commands and file artifacts. The gateway is a defense-in-depth
+choke point before sandbox execution: known privilege escalation, escape,
+egress, destructive filesystem, supply-chain, and host-secret patterns are
+denied. An unmatched artifact is still constrained by the sandbox; this
+textual gate is not treated as the isolation boundary. Evaluation errors deny.
 """
 
 from __future__ import annotations
@@ -81,7 +80,7 @@ class GatewayVerdict(BaseModel):
 
 
 class ActionGateway:
-    """Fail-closed policy evaluation for agent-generated command artifacts."""
+    """Fail-closed deny-rule screening before sandbox enforcement."""
 
     def __init__(self, *, extra_deny_rules: tuple[tuple[str, re.Pattern[str]], ...] = ()) -> None:
         self._deny_rules = _DENY_RULES + extra_deny_rules
@@ -108,7 +107,7 @@ class ActionGateway:
                     )
         except re.error as exc:  # pragma: no cover — fail-closed by construction
             return GatewayVerdict(allowed=False, rule="gateway_error", reason=f"Gateway evaluation failed: {exc}")
-        return GatewayVerdict(allowed=True, rule="default", reason="No harness policy violation")
+        return GatewayVerdict(allowed=True, rule="default", reason="No deny-rule matched; sandbox controls remain mandatory")
 
     def evaluate_write_path(self, path: str) -> GatewayVerdict:
         """Evaluate a relative write target. Absolute, traversal, and drive paths are denied."""

@@ -63,12 +63,11 @@ class WargameReadout:
             except asyncio.CancelledError:
                 pass
             self._flush_task = None
-        if self._pane_live and self._drawn:
-            # Release the pane region so the mission log continues below it.
-            self._console._out(f"\x1b[{self._height}F")
-            for _ in range(self._height):
-                self._console._out("\x1b[2K\n")
-            self._console._out(f"\x1b[{self._height}A")
+        # Leave the final frame on screen as the round's record; the mission
+        # log continues below it.
+        if self._pane_live and (self._dirty or not self._drawn):
+            self._dirty = False
+            self._draw_frame()
         self._console.line("  [WARGAME] pane closed", DIM)
 
     # -- feeds ---------------------------------------------------------------

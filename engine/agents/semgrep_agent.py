@@ -1,85 +1,93 @@
+"""Optional bounded Semgrep integration for deterministic static analysis."""
+
+from __future__ import annotations
+
+import asyncio
 import json
 import logging
-import asyncio
-import tempfile
 import os
 import shutil
+import tempfile
+from collections.abc import Mapping
+from pathlib import Path, PurePosixPath
 
-from typing import Mapping
-
-from engine.agents.architect_agent import ThreatFinding, Severity
+from engine.agents.architect_agent import Severity, ThreatFinding
 
 logger = logging.getLogger(__name__)
+_MAX_OUTPUT = 8 * 1024 * 1024
+
 
 class SemgrepAgent:
-    """Deterministic static analysis using the Semgrep CLI."""
-    
-    def __init__(self, ruleset: str = "p/ci"):
-        self.ruleset = ruleset
+    """Run an operator-configured Semgrep ruleset with argv-safe subprocess execution."""
+
+    def __init__(self, ruleset: str | None = None) -> None:
+        self.executable = shutil.which("semgrep") or shutil.which("semgrep.exe")
+        self.ruleset = (ruleset or os.environ.get("ARBALEST_SEMGREP_CONFIG", "")).strip()
+
+    @property
+    def available(self) -> bool:
+        return bool(self.executable and self.ruleset)
 
     async def analyze(self, legacy_sources: Mapping[str, str]) -> list[ThreatFinding]:
-        """Runs semgrep on the source directory to find known deterministic flaws."""
-        if not legacy_sources:
+        if not legacy_sources or not self.available:
             return []
-            
-        findings: list[ThreatFinding] = []
-        temp_dir = tempfile.mkdtemp(prefix="arbalest_semgrep_")
-        
+        temp_root = Path(tempfile.mkdtemp(prefix="arbalest-semgrep-"))
         try:
-            # Write sources to disk for Semgrep CLI
-            for file_path, content in legacy_sources.items():
-                full_path = os.path.join(temp_dir, file_path.lstrip("/"))
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                with open(full_path, "w", encoding="utf-8") as f:
-                    f.write(content)
-            
-            # Run semgrep subprocess
-            cmd = [
-                "semgrep", "scan",
-                "--config", self.ruleset,
-                "--json",
-                "--quiet",
-                temp_dir
-            ]
-            
+            for relative, content in list(legacy_sources.items())[:2_000]:
+                normalized = relative.replace("\\", "/")
+                path = PurePosixPath(normalized)
+                if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+                    continue
+                destination = temp_root.joinpath(*path.parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_text(content, encoding="utf-8")
             process = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                str(self.executable), "scan", "--config", self.ruleset, "--json", "--quiet", "--metrics", "off", str(temp_root),
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                env={**os.environ, "SEMGREP_SEND_METRICS": "off"},
             )
-            stdout, stderr = await process.communicate()
-            
-            if stdout:
+            try:
+                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=180)
+            except TimeoutError:
+                process.kill()
+                await process.wait()
+                raise RuntimeError("Semgrep exceeded the 180 second limit")
+            if len(stdout) > _MAX_OUTPUT or len(stderr) > _MAX_OUTPUT:
+                raise RuntimeError("Semgrep output exceeded the configured safety limit")
+            if process.returncode not in (0, 1):
+                raise RuntimeError(f"Semgrep failed with exit {process.returncode}: {stderr.decode(errors='replace')[:300]}")
+            try:
+                payload = json.loads(stdout or b"{}")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Semgrep returned invalid JSON") from exc
+            findings: list[ThreatFinding] = []
+            for index, result in enumerate(payload.get("results", [])[:1_000]):
+                if not isinstance(result, dict):
+                    continue
+                extra = result.get("extra", {}) if isinstance(result.get("extra"), dict) else {}
+                metadata = extra.get("metadata", {}) if isinstance(extra.get("metadata"), dict) else {}
+                raw_path = str(result.get("path", ""))
                 try:
-                    data = json.loads(stdout)
-                    results = data.get("results", [])
-                    for i, r in enumerate(results):
-                        severity_map = {
-                            "ERROR": Severity.CRITICAL,
-                            "WARNING": Severity.MEDIUM,
-                            "INFO": Severity.LOW
-                        }
-                        sev = severity_map.get(r.get("extra", {}).get("severity", "WARNING"), Severity.MEDIUM)
-                        path_str = r.get("path", "")
-                        # Remove temp_dir prefix
-                        if path_str.startswith(temp_dir):
-                            path_str = path_str[len(temp_dir):].lstrip("/\\")
-                        
-                        f = ThreatFinding(
-                            finding_id=f"semgrep-{i+1}",
-                            summary=r.get("extra", {}).get("message", "Semgrep Finding"),
-                            cwe=r.get("extra", {}).get("metadata", {}).get("cwe", ["Unknown"])[0],
-                            severity=sev,
-                            evidence=[f"File: {path_str}", f"Line: {r.get('start', {}).get('line', 0)}"],
-                            affected_nodes=[]
-                        )
-                        findings.append(f)
-                except json.JSONDecodeError:
-                    logger.warning("Failed to parse Semgrep JSON output.")
-                    
-        except Exception as e:
-            logger.error(f"SemgrepAgent failed: {e}")
+                    relative = Path(raw_path).resolve().relative_to(temp_root.resolve()).as_posix()
+                except ValueError:
+                    continue
+                raw_cwe = metadata.get("cwe", "CWE-20")
+                if isinstance(raw_cwe, list):
+                    raw_cwe = raw_cwe[0] if raw_cwe else "CWE-20"
+                severity = {"ERROR": Severity.HIGH, "WARNING": Severity.MEDIUM, "INFO": Severity.LOW}.get(
+                    str(extra.get("severity", "WARNING")).upper(), Severity.MEDIUM
+                )
+                line = int((result.get("start") or {}).get("line", 1))
+                rule_id = str(result.get("check_id", f"rule-{index + 1}"))
+                findings.append(ThreatFinding(
+                    finding_id=f"SEMGREP-{rule_id}-{relative}-{line}"[:128],
+                    summary=str(extra.get("message") or f"Semgrep rule {rule_id} matched")[:4000],
+                    cwe=str(raw_cwe)[:64], severity=severity, affected_nodes=[relative],
+                    evidence=[f"line {max(line, 1)}: deterministic Semgrep rule {rule_id}"],
+                ))
+            return findings
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            
-        return findings
+            shutil.rmtree(temp_root, ignore_errors=True)
+
+
+__all__ = ["SemgrepAgent"]

@@ -2,7 +2,7 @@
 
 Every war-game leaves the organism permanently smarter. The AntibodyLab turns
 the confirmed exploit history (the Red Team's successful breaches inside the
-Nebius Token Factory Sandbox) into a Semgrep YAML rule. Each antibody is
+verification sandbox) into a Semgrep YAML rule. Each antibody is
 self-tested before entering memory:
 
   * the regex must MATCH the original vulnerable code,
@@ -123,6 +123,8 @@ class AntibodyRegistry:
         return any(entry.get("rule_id") == rule_id for entry in self.entries)
 
     def save(self, antibody: Antibody) -> None:
+        if not antibody.validated:
+            raise AntibodyError("refusing to persist an unvalidated antibody")
         self.directory.mkdir(parents=True, exist_ok=True)
         (self.directory / f"{antibody.rule_id}.yml").write_text(antibody.yaml_text, encoding="utf-8")
         antibody.path = str(self.directory / f"{antibody.rule_id}.yml")
@@ -154,7 +156,7 @@ class AntibodyLab:
         breach_history: list[dict[str, object]],
     ) -> Antibody:
         lang = _LANG_TAG.get(_ext_lang(finding.file), "python")
-        payload = {
+        payload: dict[str, object] = {
             "vulnerability": {
                 "rule_id": finding.rule_id, "name": finding.name, "cwe": finding.cwe,
                 "file": finding.file, "line": finding.line,
@@ -235,6 +237,7 @@ class AntibodyLab:
                 "metadata": {
                     "cwe": spec.cwe,
                     "arbalest-antibody": True,
+                    "validated": True,
                     "learned-from": f"{finding.rule_id} @ {finding.file}:{finding.line}",
                 },
             }]
@@ -269,33 +272,39 @@ class AntibodyLab:
 
         semgrep = shutil.which("semgrep") or shutil.which("semgrep.exe")
         if semgrep:
-            result = self._run_semgrep(antibody)
+            result = self._run_semgrep(antibody, vulnerable_code, patched_code)
             antibody.semgrep_checked = result
             if not result:
                 antibody.validated = False
                 antibody.validation_detail = "authoritative semgrep run did not reproduce the match"
 
-    def _run_semgrep(self, antibody: Antibody) -> bool:
+    def _run_semgrep(self, antibody: Antibody, vulnerable_code: str, patched_code: str) -> bool:
         semgrep = shutil.which("semgrep") or shutil.which("semgrep.exe")
+        if semgrep is None:
+            return False
+        extension = {"python": ".py", "javascript": ".js", "typescript": ".ts", "go": ".go", "rust": ".rs"}.get(antibody.language, ".txt")
         try:
             self._registry.directory.mkdir(parents=True, exist_ok=True)
             rule_path = self._registry.directory / f"_selftest_{antibody.rule_id}.yml"
+            vulnerable_path = self._registry.directory / f"_selftest_vulnerable{extension}"
+            patched_path = self._registry.directory / f"_selftest_patched{extension}"
             rule_path.write_text(antibody.yaml_text, encoding="utf-8")
-            sample = self._registry.directory / "_selftest_sample.py"
-            sample.write_text(
-                "def _probe():\n    import os\n    os.system('ls')\n",
-                encoding="utf-8",
-            )
+            vulnerable_path.write_text(vulnerable_code, encoding="utf-8")
+            patched_path.write_text(patched_code, encoding="utf-8")
             try:
-                proc = subprocess.run(
-                    [semgrep, "--config", str(rule_path), str(sample), "--json", "--quiet"],
+                vulnerable_run = subprocess.run(
+                    [semgrep, "--config", str(rule_path), str(vulnerable_path), "--json", "--quiet"],
                     capture_output=True, text=True, timeout=120,
                 )
-                matched = antibody.rule_id in (proc.stdout or "")
+                patched_run = subprocess.run(
+                    [semgrep, "--config", str(rule_path), str(patched_path), "--json", "--quiet"],
+                    capture_output=True, text=True, timeout=120,
+                )
+                return antibody.rule_id in vulnerable_run.stdout and antibody.rule_id not in patched_run.stdout
             finally:
                 rule_path.unlink(missing_ok=True)
-                sample.unlink(missing_ok=True)
-            return matched
+                vulnerable_path.unlink(missing_ok=True)
+                patched_path.unlink(missing_ok=True)
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -336,6 +345,9 @@ def load_antibodies(root: Path, *, directory: Path | None = None) -> list[Loaded
                 if not pattern:
                     continue
                 meta = rule.get("metadata", {}) or {}
+                if meta.get("arbalest-antibody") is not True or meta.get("validated") is not True:
+                    logger.warning("Skipping unvalidated antibody %s", yaml_path.name)
+                    continue
                 loaded.append(LoadedAntibody(
                     rule_id=str(rule.get("id", yaml_path.stem)),
                     language=str(rule.get("languages", ["python"])[0]),
@@ -350,28 +362,34 @@ def load_antibodies(root: Path, *, directory: Path | None = None) -> list[Loaded
 
 
 def antibody_sweep(rel_path: str, content: str, antibodies: list[LoadedAntibody]) -> list[DetectionFinding]:
-    """Fire learned antibodies against a file — the organism remembering."""
+    """Apply learned rules with the same whole-document regex semantics used by self-tests."""
     ext = Path(rel_path).suffix.lower().lstrip(".")
     lang = _LANG_TAG.get(ext)
     if lang is None:
         return []
     findings: list[DetectionFinding] = []
-    for line_no, raw_line in enumerate(content.splitlines(), 1):
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith(("#", "//")):
+    for antibody in antibodies:
+        if antibody.language != lang:
             continue
-        for antibody in antibodies:
-            if antibody.language != lang:
+        for match in list(antibody.compiled.finditer(content))[:50]:
+            line_no = content.count("\n", 0, match.start()) + 1
+            line_start = content.rfind("\n", 0, match.start()) + 1
+            line_end = content.find("\n", match.end())
+            if line_end < 0:
+                line_end = len(content)
+            evidence = content[line_start:line_end].strip()[:200]
+            if not evidence or evidence.startswith(("#", "//")):
                 continue
-            match = antibody.compiled.search(raw_line)
-            if match:
-                findings.append(DetectionFinding(
-                    rule_id=antibody.rule_id,
-                    name=f"Learned antibody: {antibody.message or antibody.rule_id}",
-                    cwe=antibody.cwe,
-                    severity="critical" if antibody.severity == "ERROR" else "high",
-                    file=rel_path, line=line_no, col=match.start() + 1,
-                    evidence=stripped[:200], hint="Synthesized by the Immune System from a confirmed breach",
-                    learned=True,
-                ))
+            findings.append(DetectionFinding(
+                rule_id=antibody.rule_id,
+                name=f"Learned antibody: {antibody.message or antibody.rule_id}",
+                cwe=antibody.cwe,
+                severity="critical" if antibody.severity == "ERROR" else "high",
+                file=rel_path,
+                line=line_no,
+                col=max(1, match.start() - line_start + 1),
+                evidence=evidence,
+                hint="Synthesized from a confirmed, sandbox-verified breach",
+                learned=True,
+            ))
     return findings

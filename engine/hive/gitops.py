@@ -1,17 +1,15 @@
-"""Fleet GitOps — synchronized branch → commit → pull-request across repositories.
-
-Real `git` operations per repository (real `gh` when the CLI is installed and
-authenticated), executed concurrently by the mission. Nothing is simulated:
-when a pull request cannot be opened, the exact command and a complete PR
-summary are written to disk for the operator.
-"""
+"""Isolated branch, commit, push, and pull-request operations for verified fixes."""
 
 from __future__ import annotations
 
+import os
+import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Mapping
 
 _GIT_TIMEOUT = 60
 
@@ -34,29 +32,35 @@ class FleetGitOpsError(RuntimeError):
     pass
 
 
-def _git(repo: Path, *args: str) -> str:
-    proc = subprocess.run(
-        ["git", *args], cwd=str(repo), capture_output=True, text=True, timeout=_GIT_TIMEOUT,
-    )
+def _git(repo: Path, *args: str, timeout: int = _GIT_TIMEOUT) -> str:
+    proc = subprocess.run(["git", *args], cwd=str(repo), capture_output=True, text=True, timeout=timeout)
     if proc.returncode != 0:
-        raise FleetGitOpsError(f"git {' '.join(args[:2])} failed: {proc.stderr.strip()[:300]}")
+        message = (proc.stderr or proc.stdout or "git command failed").replace("\n", " ")[:300]
+        raise FleetGitOpsError(f"git {args[0] if args else 'operation'} failed: {message}")
     return proc.stdout.strip()
 
 
+def _safe_path(value: str) -> str:
+    normalized = value.replace("\\", "/")
+    path = PurePosixPath(normalized)
+    if not normalized or path.is_absolute() or ":" in normalized or any(part in {"", ".", ".."} for part in path.parts):
+        raise FleetGitOpsError(f"unsafe repository-relative path: {value!r}")
+    return path.as_posix()
+
+
 class FleetGitOps:
-    """Branch, commit, and open synchronized PRs across affected repositories."""
+    """Create commits in temporary Git worktrees without touching operator state."""
 
     def __init__(self, *, incident: str) -> None:
-        self._incident = incident
+        self._incident = re.sub(r"[^A-Za-z0-9_-]", "", incident)[:64] or "incident"
 
     @staticmethod
     def is_repo(path: Path) -> bool:
         try:
             proc = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"], cwd=str(path),
-                capture_output=True, text=True, timeout=15,
+                ["git", "rev-parse", "--show-toplevel"], cwd=str(path), capture_output=True, text=True, timeout=15,
             )
-            return proc.returncode == 0 and proc.stdout.strip() == "true"
+            return proc.returncode == 0 and Path(proc.stdout.strip()).resolve() == path.resolve()
         except (OSError, subprocess.TimeoutExpired):
             return False
 
@@ -69,79 +73,137 @@ class FleetGitOps:
         summary: str,
         evidence: list[str],
         branch_prefix: str = "arbalest/hive",
+        content_by_path: Mapping[str, str | bytes] | None = None,
     ) -> FleetPullRequest:
         repo = repo_path.resolve()
+        if not self.is_repo(repo):
+            raise FleetGitOpsError(f"not a Git worktree root: {repo}")
+        requested = list(dict.fromkeys(_safe_path(item) for item in files))
+        if not requested:
+            raise FleetGitOpsError("no verified files were supplied")
+
+        exact_content: dict[str, bytes] = {}
+        if content_by_path is None:
+            for relative in requested:
+                source = (repo / relative).resolve()
+                try:
+                    source.relative_to(repo)
+                except ValueError as exc:
+                    raise FleetGitOpsError(f"path escapes repository: {relative}") from exc
+                if not source.is_file():
+                    raise FleetGitOpsError(f"verified file does not exist: {relative}")
+                exact_content[relative] = source.read_bytes()
+        else:
+            if set(content_by_path) != set(requested):
+                raise FleetGitOpsError("exact content keys must match requested files")
+            for relative in requested:
+                value = content_by_path[relative]
+                exact_content[relative] = value if isinstance(value, bytes) else value.encode("utf-8")
+
         original_branch = _git(repo, "branch", "--show-current") or "HEAD"
-        base_branch = f"{branch_prefix}-{cwe.lower().replace('-', '')}"
-        branch, suffix = base_branch, 2
-        while True:
-            check = subprocess.run(
-                ["git", "rev-parse", "--verify", f"refs/heads/{branch}"],
-                cwd=str(repo), capture_output=True, text=True, timeout=15,
-            )
-            if check.returncode != 0:
-                break
-            branch = f"{base_branch}-{suffix}"
+        base = f"{branch_prefix}-{cwe.lower().replace('-', '')}"
+        branch, suffix = base, 2
+        while subprocess.run(
+            ["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=repo, timeout=15,
+        ).returncode == 0:
+            branch = f"{base}-{suffix}"
             suffix += 1
 
-        _git(repo, "checkout", "-b", branch)
+        worktree = Path(tempfile.mkdtemp(prefix="arbalest-gitops-"))
+        commit = ""
+        changed: list[str] = []
         try:
-            for rel in files:
-                _git(repo, "add", "--", rel)
+            _git(repo, "worktree", "add", "--quiet", "-b", branch, str(worktree), "HEAD")
+            for relative, content in exact_content.items():
+                destination = worktree.joinpath(*PurePosixPath(relative).parts)
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(content)
+                mode_output = _git(worktree, "ls-files", "-s", "--", relative)
+                mode = mode_output.split(None, 1)[0] if mode_output else "100644"
+                blob_process = subprocess.run(
+                    ["git", "hash-object", "-w", "--stdin"], cwd=worktree,
+                    input=content, capture_output=True, timeout=30,
+                )
+                if blob_process.returncode != 0:
+                    raise FleetGitOpsError(f"could not store verified blob for {relative}")
+                blob = blob_process.stdout.decode("ascii", errors="strict").strip()
+                _git(worktree, "update-index", "--add", "--cacheinfo", f"{mode},{blob},{relative}")
+            changed = [line for line in _git(worktree, "diff", "--cached", "--name-only", "--").splitlines() if line]
+            unexpected = set(changed) - set(requested)
+            if unexpected:
+                raise FleetGitOpsError(f"isolated commit contains unexpected paths: {sorted(unexpected)}")
+            if not changed:
+                raise FleetGitOpsError("verified content is identical to HEAD; no commit created")
             message = (
                 f"fix(security): auto-heal {cwe} (fleet incident {self._incident})\n\n"
-                f"Origin patch propagated by the Arbalest Hive Mind.\n"
-                f"Verified by RedTeamSwarm war-games in Nebius Token Factory Sandboxes.\n\n"
-                + "\n".join(f"- {ev[:200]}" for ev in evidence[:5])
+                "Verified in an isolated Arbalest sandbox.\n\n"
+                + "\n".join(f"- {item[:200]}" for item in evidence[:5])
             )
-            _git(repo, "commit", "-m", message)
-            commit = _git(repo, "rev-parse", "--short", "HEAD")
+            _git(worktree, "commit", "-m", message)
+            commit = _git(worktree, "rev-parse", "--short", "HEAD")
+            committed = set(_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", "HEAD").splitlines())
+            if committed != set(changed):
+                raise FleetGitOpsError("commit tree did not match the staged verified paths")
+            for relative in changed:
+                blob_read = subprocess.run(
+                    ["git", "show", f"HEAD:{relative}"], cwd=worktree, capture_output=True, timeout=30,
+                )
+                if blob_read.returncode != 0 or blob_read.stdout != exact_content[relative]:
+                    raise FleetGitOpsError(f"committed blob differs from verified bytes: {relative}")
         finally:
-            _git(repo, "checkout", original_branch)
-
-        pr = FleetPullRequest(
-            repo=repo.name, branch=branch, commit=commit, restored_branch=original_branch,
-            files_committed=list(files), summary_path="",
-        )
+            with _suppress_git_errors():
+                _git(repo, "worktree", "remove", "--force", str(worktree))
+            shutil.rmtree(worktree, ignore_errors=True)
 
         summary_path = repo / ".arbalest" / "hive" / f"pr-{branch.replace('/', '-')}.md"
         summary_path.parent.mkdir(parents=True, exist_ok=True)
-        summary_path.write_text(self._pr_markdown(cwe=cwe, files=files, summary=summary, evidence=evidence,
-                                                  branch=branch, commit=commit), encoding="utf-8")
-        pr.summary_path = str(summary_path)
+        summary_path.write_text(
+            self._pr_markdown(cwe=cwe, files=changed, summary=summary, evidence=evidence, branch=branch, commit=commit),
+            encoding="utf-8",
+        )
+        result = FleetPullRequest(
+            repo=repo.name, branch=branch, commit=commit, restored_branch=original_branch,
+            files_committed=changed, summary_path=str(summary_path),
+        )
 
         gh = shutil.which("gh") or shutil.which("gh.exe")
-        if gh:
-            proc = subprocess.run(
-                [gh, "pr", "create", "--head", branch,
-                 "--title", f"Arbalest fleet heal: {cwe} ({self._incident})",
-                 "--body-file", str(summary_path)],
-                cwd=str(repo), capture_output=True, text=True, timeout=120,
-            )
-            if proc.returncode == 0 and proc.stdout.strip():
-                pr.pr_url = proc.stdout.strip().splitlines()[-1]
-            else:
-                pr.pr_error = (proc.stderr or "gh pr create failed").strip()[:300]
+        remotes = _git(repo, "remote").splitlines()
+        if "origin" not in remotes:
+            result.pr_error = "no origin remote; verified branch remains local"
+            return result
+        try:
+            _git(repo, "push", "-u", "origin", branch, timeout=120)
+        except FleetGitOpsError as exc:
+            result.pr_error = str(exc)
+            return result
+        if gh is None:
+            result.pr_error = "gh CLI unavailable; branch was pushed and PR summary is on disk"
+            return result
+        proc = subprocess.run(
+            [gh, "pr", "create", "--head", branch, "--title", f"Arbalest security fix: {cwe} ({self._incident})",
+             "--body-file", str(summary_path)],
+            cwd=repo, capture_output=True, text=True, timeout=120,
+            env={**os.environ, "GH_PROMPT_DISABLED": "1"},
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            result.pr_url = proc.stdout.strip().splitlines()[-1]
         else:
-            pr.pr_error = "gh CLI not installed — PR summary staged on disk"
-        return pr
+            result.pr_error = (proc.stderr or "gh pr create failed").replace("\n", " ")[:300]
+        return result
 
     @staticmethod
-    def _pr_markdown(*, cwe: str, files: list[str], summary: str, evidence: list[str],
-                     branch: str, commit: str) -> str:
-        lines = [
-            f"## 🛡 Arbalest Fleet Auto-Heal — {cwe}",
-            "",
-            f"- **Branch:** `{branch}` (commit `{commit}`)",
-            "- **Verified:** RedTeamSwarm minimax war-game, Nebius Token Factory Sandbox",
-            f"- **Healed files:** {', '.join(f'`{f}`' for f in files) or '—'}",
-            "",
-            "### Remediation summary",
-            summary,
-            "",
-            "### Attack-chain evidence",
-            *[f"- {ev[:300]}" for ev in evidence[:8]],
-            "",
-            "_Generated autonomously by the Arbalest Hive Mind. Review, then merge._",
-        ]
-        return "\n".join(lines)
+    def _pr_markdown(*, cwe: str, files: list[str], summary: str, evidence: list[str], branch: str, commit: str) -> str:
+        return "\n".join([
+            f"## Arbalest Fleet Auto-Heal — {cwe}", "", f"- **Branch:** `{branch}` (commit `{commit}`)",
+            "- **Verification:** isolated adversarial sandbox", f"- **Files:** {', '.join(f'`{item}`' for item in files) or '—'}",
+            "", "### Summary", summary[:2000], "", "### Evidence", *[f"- {item[:300]}" for item in evidence[:8]],
+            "", "_Review the exact verified bytes before merging._",
+        ])
+
+
+class _suppress_git_errors:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return True

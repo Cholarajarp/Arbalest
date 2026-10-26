@@ -1,0 +1,44 @@
+{
+ "classes": [
+  {
+   "id": "sql-injection",
+   "keywords": [
+    "sql",
+    "injection"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "command-injection",
+   "keywords": [
+    "shell",
+    "injection"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "code-evaluation",
+   "keywords": [
+    "eval",
+    "code"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "deserialization",
+   "keywords": [
+    "deserialization",
+    "pickle"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "hardcoded-credential",
+   "keywords": [
+    "hardcoded",
+    "credential"
+   ],
+   "layer": "deterministic"
+  }
+ ]
+}

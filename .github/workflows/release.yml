@@ -1,0 +1,183 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag (for example v1.0.0); select the same tag as the workflow ref'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.release.outputs.version }}
+      image: ${{ steps.release.outputs.image }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4, same pin as CI
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5, same pin as CI
+        with:
+          python-version: '3.12'
+      - name: Gate version, tag and locked metadata
+        id: release
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: python scripts/verify-release.py --tag "$RELEASE_TAG" --github-output
+
+  tests:
+    needs: validate
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    env:
+      ARBALEST_SKIP_DOTENV: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - name: Install locked toolchain
+        run: python -m pip install uv==0.11.21
+      - name: Check lock and install development dependencies
+        run: uv sync --locked --group dev
+      - name: Validate release files
+        run: uv run --frozen python scripts/verify-release.py --check-files
+      - name: Lint
+        run: uv run --frozen ruff check .
+      - name: Type check production code
+        run: uv run --frozen mypy
+      - name: Unit and contract tests
+        run: uv run --frozen pytest -q
+      - name: Static security checks
+        run: uv run --frozen bandit -q -ll -r engine arbalest_cli.py mcp_server.py
+      - name: Dependency audit
+        run: uv run --frozen pip-audit -r requirements.txt
+      - name: Build distributions
+        run: uv build --locked
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4, verified upstream commit
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: sdk/typescript/package-lock.json
+      - name: Install locked TypeScript SDK dependencies
+        working-directory: sdk/typescript
+        run: npm ci --no-audit --no-fund
+      - name: Compile and test TypeScript SDK
+        working-directory: sdk/typescript
+        run: npm test
+      - name: Check local SDK package contents without publishing
+        working-directory: sdk/typescript
+        run: npm pack --dry-run
+
+  publish:
+    needs: [validate, tests]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      IMAGE: ${{ needs.validate.outputs.image }}
+      VERSION: ${{ needs.validate.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-qemu-action@c7c53464625b32c7a7e944ae62b3e17d2b600130 # v3
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+      - uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and publish image index
+        id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ env.IMAGE }}:${{ env.VERSION }}
+            ${{ env.IMAGE }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.VERSION }}
+            org.opencontainers.image.licenses=MIT
+      - name: Install checksum-verified Cosign
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3 (peeled commit)
+        with:
+          cosign-release: v2.5.2
+      - name: Install checksum-anchored Syft 1.55.0
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/anchore/syft/releases/download/v1.55.0/syft_1.55.0_linux_amd64.tar.gz \
+            --output "$RUNNER_TEMP/syft.tar.gz"
+          echo 'bb65249542db5fedeeb4d3f9b018b75e7264dbfbbb10486f044581a92f90490d  '"$RUNNER_TEMP/syft.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/release-tools"
+          tar -xzf "$RUNNER_TEMP/syft.tar.gz" -C "$RUNNER_TEMP/release-tools" syft
+          echo "$RUNNER_TEMP/release-tools" >> "$GITHUB_PATH"
+      - name: Sign digest and attest both platform SBOMs using GitHub OIDC
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          subject="$IMAGE@$DIGEST"
+          cosign sign --yes "$subject"
+          for arch in amd64 arm64; do
+            syft scan "registry:$subject" --platform "linux/$arch" \
+              --output "spdx-json=$RUNNER_TEMP/sbom-$arch.spdx.json"
+            cosign attest --yes --type spdxjson \
+              --predicate "$RUNNER_TEMP/sbom-$arch.spdx.json" "$subject"
+          done
+      - name: Verify signature and SPDX attestations against exact workflow identity
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          CERTIFICATE_IDENTITY: https://github.com/${{ github.workflow_ref }}
+        run: |
+          set -euo pipefail
+          subject="$IMAGE@$DIGEST"
+          cosign verify \
+            --certificate-identity "$CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$subject" > "$RUNNER_TEMP/verified-signature.json"
+          cosign verify-attestation --type spdxjson \
+            --certificate-identity "$CERTIFICATE_IDENTITY" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$subject" > "$RUNNER_TEMP/verified-attestations.jsonl"
+          {
+            echo '## Verified release image'
+            echo "- Immutable image: \`$subject\`"
+            echo "- Certificate identity: \`$CERTIFICATE_IDENTITY\`"
+            echo '- SPDX SBOMs: linux/amd64 and linux/arm64 (signed predicates on the index)'
+            echo '- BuildKit SBOM and maximum-mode provenance are attached to the index'
+          } >> "$GITHUB_STEP_SUMMARY"

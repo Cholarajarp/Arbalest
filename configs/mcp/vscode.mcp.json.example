@@ -1,0 +1,23 @@
+{
+  "inputs": [
+    {
+      "type": "promptString",
+      "id": "nebius-api-key",
+      "description": "Nebius Token Factory API key",
+      "password": true
+    }
+  ],
+  "servers": {
+    "arbalest": {
+      "type": "stdio",
+      "command": "arbalest-mcp",
+      "args": [],
+      "env": {
+        "ARBALEST_PROVIDER": "nebius",
+        "ARBALEST_MODEL": "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "NEBIUS_API_KEY": "${input:nebius-api-key}",
+        "ARBALEST_MCP_ALLOWED_ROOTS": "${workspaceFolder}"
+      }
+    }
+  }
+}

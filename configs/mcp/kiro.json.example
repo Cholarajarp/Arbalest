@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "arbalest": {
+      "command": "arbalest-mcp",
+      "args": [],
+      "env": {
+        "ARBALEST_PROVIDER": "nebius",
+        "ARBALEST_MODEL": "nvidia/Nemotron-3-Ultra-550b-a55b",
+        "ARBALEST_MCP_ALLOWED_ROOTS": "C:/path/to/authorized/workspaces"
+      },
+      "disabled": false
+    }
+  }
+}

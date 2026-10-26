@@ -1,0 +1,28 @@
+{
+ "classes": [
+  {
+   "id": "php2shell-runtime",
+   "keywords": [
+    "php2shell",
+    "cve-2026-109618"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "gitlab-october-2026",
+   "keywords": [
+    "gitlab",
+    "cve-2026-110264"
+   ],
+   "layer": "deterministic"
+  },
+  {
+   "id": "nodejs-october-2026",
+   "keywords": [
+    "node",
+    "october"
+   ],
+   "layer": "deterministic"
+  }
+ ]
+}

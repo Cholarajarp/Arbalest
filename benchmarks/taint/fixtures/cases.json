@@ -1,0 +1,150 @@
+[
+  {
+    "name": "relative_sql_alias",
+    "sources": {
+      "pkg/__init__.py": "",
+      "pkg/db.py": "def lookup(cursor, value):\n    query = 'SELECT * FROM users WHERE name=' + value\n    cursor.execute(query)\n",
+      "pkg/web.py": "from flask import request as incoming\nfrom .db import lookup as search\ndef endpoint(cursor):\n    search(cursor, incoming.args.get('name'))\n"
+    },
+    "expected": [["pkg/db.py", 3, "CWE-89"]]
+  },
+  {
+    "name": "shell_return_chain",
+    "sources": {
+      "source.py": "from flask import request\ndef read():\n    return request.form['cmd']\n",
+      "relay.py": "from source import read as fetch\ndef command():\n    return 'echo ' + fetch()\n",
+      "main.py": "import os as operating\nfrom relay import command\noperating.system(command())\n"
+    },
+    "expected": [["main.py", 3, "CWE-78"]]
+  },
+  {
+    "name": "eval_keyword",
+    "sources": {
+      "evaluate.py": "def calculate(*, expression):\n    return eval(expression)\n",
+      "web.py": "from flask import request\nfrom evaluate import calculate as run\ndef endpoint():\n    return run(expression=request.get_json()['expr'])\n"
+    },
+    "expected": [["evaluate.py", 2, "CWE-95"]]
+  },
+  {
+    "name": "path_normalization_is_not_validation",
+    "sources": {
+      "files.py": "import os.path\ndef read(name):\n    return open(os.path.normpath('/srv/' + name)).read()\n",
+      "web.py": "from flask import request\nimport files as storage\ndef endpoint():\n    return storage.read(request.args['file'])\n"
+    },
+    "expected": [["files.py", 3, "CWE-22"]]
+  },
+  {
+    "name": "quote_not_sql_sanitizer",
+    "sources": {
+      "clean.py": "from shlex import quote as escape\ndef clean(value):\n    return escape(value)\n",
+      "web.py": "from flask import request\nfrom clean import clean\ndef endpoint(cursor):\n    cursor.execute('SELECT ' + clean(request.args['q']))\n"
+    },
+    "expected": [["web.py", 4, "CWE-89"]]
+  },
+  {
+    "name": "cli_shell",
+    "sources": {
+      "commands.py": "import subprocess as sp\ndef run(value):\n    sp.run(value, shell=True)\n",
+      "main.py": "from commands import run\nimport sys as system\nrun(system.argv[1])\n"
+    },
+    "expected": [["commands.py", 3, "CWE-78"]]
+  },
+  {
+    "name": "parent_relative_reexport",
+    "sources": {
+      "pkg/__init__.py": "from .danger import execute as run\n",
+      "pkg/danger.py": "import os\ndef execute(value):\n    os.system(value)\n",
+      "pkg/views/__init__.py": "",
+      "pkg/views/web.py": "from .. import run\nfrom flask import request\ndef endpoint():\n    run(request.args['cmd'])\n"
+    },
+    "expected": [["pkg/danger.py", 3, "CWE-78"]]
+  },
+  {
+    "name": "recursive_summary",
+    "sources": {
+      "relay.py": "def relay(value, flag):\n    if flag:\n        return relay(value, False)\n    return value\n",
+      "web.py": "from flask import request\nfrom relay import relay\ndef endpoint():\n    eval(relay(request.args['code'], True))\n"
+    },
+    "expected": [["web.py", 4, "CWE-95"]]
+  },
+  {
+    "name": "numeric_path_still_controlled",
+    "sources": {
+      "paths.py": "def filename(value):\n    return str(int(value))\n",
+      "web.py": "from paths import filename\nfrom flask import request\ndef endpoint():\n    open(filename(request.args['id']))\n"
+    },
+    "expected": [["web.py", 4, "CWE-22"]]
+  },
+  {
+    "name": "environment_eval",
+    "sources": {
+      "config.py": "import os as operating\ndef expression():\n    return operating.getenv('EXPR')\n",
+      "main.py": "from config import expression\nexec(expression())\n"
+    },
+    "expected": [["main.py", 2, "CWE-95"]]
+  },
+  {
+    "name": "parameterized_sql",
+    "sources": {
+      "db.py": "def lookup(cursor, value):\n    cursor.execute('SELECT * FROM users WHERE name = %s', (value,))\n",
+      "web.py": "from flask import request\nfrom db import lookup\ndef endpoint(cursor):\n    lookup(cursor, request.args['name'])\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "shell_quote_specific",
+    "sources": {
+      "clean.py": "import shlex\ndef argument(value):\n    return shlex.quote(value)\n",
+      "web.py": "from flask import request\nfrom clean import argument\nimport os\ndef endpoint():\n    os.system('echo ' + argument(request.args['word']))\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "no_shell_argv",
+    "sources": {
+      "commands.py": "import subprocess\ndef run(value):\n    subprocess.run(['echo', value], shell=False)\n",
+      "web.py": "from commands import run\nfrom flask import request\ndef endpoint():\n    run(request.args['word'])\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "numeric_sql",
+    "sources": {
+      "clean.py": "def numeric(value):\n    return str(int(value))\n",
+      "web.py": "from clean import numeric\nfrom flask import request\ndef endpoint(cursor):\n    cursor.execute('SELECT ' + numeric(request.args['n']))\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "constant_return_kills_flow",
+    "sources": {
+      "safe.py": "def constant(value):\n    return 'healthcheck'\n",
+      "web.py": "from safe import constant\nfrom flask import request\nimport os\ndef endpoint():\n    os.system(constant(request.args['cmd']))\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "constant_argument_not_parameter_source",
+    "sources": {
+      "danger.py": "import os\ndef run(value):\n    os.system(value)\n",
+      "main.py": "from danger import run\nrun('echo ready')\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "flow_sensitive_overwrite",
+    "sources": {
+      "safe.py": "def replace(value):\n    value = 'fixed.txt'\n    return value\n",
+      "web.py": "from flask import request\nfrom safe import replace\ndef endpoint():\n    open(replace(request.args['file']))\n"
+    },
+    "expected": []
+  },
+  {
+    "name": "unrelated_args_object",
+    "sources": {
+      "helper.py": "def read(parser):\n    return parser.args['cmd']\n",
+      "main.py": "from helper import read\nimport os\ndef run(parser):\n    os.system(read(parser))\n"
+    },
+    "expected": []
+  }
+]

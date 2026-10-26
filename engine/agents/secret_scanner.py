@@ -1,132 +1,131 @@
-"""Secret Scanner Agent for identifying hardcoded credentials and tokens in the codebase."""
+"""Deterministic, local-only hardcoded-secret detection and redaction."""
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import re
 from collections.abc import Mapping
-import uuid
-
-from pydantic import BaseModel, ConfigDict, Field
+from dataclasses import dataclass
 
 from engine.agents.architect_agent import Severity, ThreatFinding
-from engine.services.ai_provider import AIProvider, StructuredOutputRequest
+from engine.services.ai_provider import AIProvider
 
 logger = logging.getLogger(__name__)
 
 
-class HardcodedSecret(BaseModel):
-    """A hardcoded secret found in a source file."""
-    
-    model_config = ConfigDict(extra="forbid")
-    
-    secret_type: str = Field(description="The type of secret found (e.g. 'AWS Access Key', 'Database Password', 'API Token')")
-    affected_file: str = Field(description="The file where the secret was found")
-    line_snippet: str = Field(description="A short snippet of the code containing the secret (masking the actual secret value)")
-    severity: Severity = Field(description="Severity of the exposed secret (usually CRITICAL or HIGH)")
-    description: str = Field(description="Brief explanation of why this secret is dangerous")
+@dataclass(frozen=True, slots=True)
+class _SecretPattern:
+    kind: str
+    regex: re.Pattern[str]
+    group: str = "secret"
+    severity: Severity = Severity.HIGH
 
 
-class SecretAnalysisResult(BaseModel):
-    """The structured output from the LLM for Secret Scanning."""
-    
-    model_config = ConfigDict(extra="forbid")
-    
-    secrets: list[HardcodedSecret] = Field(
-        description="List of hardcoded secrets found in the codebase."
-    )
+_PATTERNS: tuple[_SecretPattern, ...] = (
+    _SecretPattern(
+        "credential assignment",
+        re.compile(
+            r"(?i)\b(?:(?:db|aws|smtp|redis|mongo|sql|admin|jwt|session)[_-]?)?"
+            r"(?:api[_-]?key|secret|password|passwd|token|credential|auth[_-]?token)\b"
+            r"\s*[:=]\s*[\"'](?P<secret>[^\"'\r\n]{8,})[\"']"
+        ),
+        severity=Severity.HIGH,
+    ),
+    _SecretPattern("AWS access key", re.compile(r"(?P<secret>AKIA[0-9A-Z]{16})"), severity=Severity.CRITICAL),
+    _SecretPattern("GitHub token", re.compile(r"(?P<secret>gh[pousr]_[A-Za-z0-9_]{30,255})"), severity=Severity.CRITICAL),
+    _SecretPattern("private key", re.compile(r"(?P<secret>-----BEGIN (?:RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----)"), severity=Severity.CRITICAL),
+    _SecretPattern(
+        "database credential",
+        re.compile(r"(?i)(?:postgres(?:ql)?|mongodb(?:\+srv)?|mysql)://[^\s:/@]+:(?P<secret>[^\s@/]{4,})@"),
+        severity=Severity.CRITICAL,
+    ),
+    _SecretPattern("provider API key", re.compile(r"(?P<secret>(?:sk-|sk_live_|sk_test_)[A-Za-z0-9_-]{20,})"), severity=Severity.CRITICAL),
+    _SecretPattern("bearer token", re.compile(r"(?i)\bbearer\s+(?P<secret>[A-Za-z0-9._~-]{20,})"), severity=Severity.CRITICAL),
+)
+
+_PLACEHOLDER = re.compile(
+    r"(?i)^(?:example|sample|dummy|fake|test|testing|placeholder|changeme|replace[_-]?me|your[_-]|xxx+|todo|null|none|<.*>|\$\{.*\})"
+)
+_ENV_READ = re.compile(r"(?i)(?:getenv|os\.environ|process\.env|secretstr|environment)")
 
 
-_SECRET_SCHEMA = SecretAnalysisResult.model_json_schema()
+def _mask(value: str) -> str:
+    if len(value) <= 8:
+        return "*" * len(value)
+    return f"{value[:3]}{'*' * min(len(value) - 6, 16)}{value[-3:]}"
+
+
+def _iter_matches(text: str):
+    for pattern in _PATTERNS:
+        for match in pattern.regex.finditer(text):
+            try:
+                value = match.group(pattern.group)
+            except (IndexError, KeyError):
+                continue
+            if not value or _PLACEHOLDER.match(value.strip()):
+                continue
+            line_start = text.rfind("\n", 0, match.start()) + 1
+            line_end = text.find("\n", match.end())
+            if line_end < 0:
+                line_end = len(text)
+            line = text[line_start:line_end]
+            if _ENV_READ.search(line) and not re.search(r"[\"'][^\"']{8,}[\"']", line):
+                continue
+            yield pattern, match, value, line_start, line_end
+
+
+def redact_secrets(text: str) -> str:
+    """Mask recognized secret values before content crosses a model boundary."""
+    replacements: list[tuple[int, int, str]] = []
+    for pattern, match, value, _line_start, _line_end in _iter_matches(text):
+        start, end = match.span(pattern.group)
+        replacements.append((start, end, _mask(value)))
+    redacted = text
+    for start, end, replacement in sorted(replacements, reverse=True):
+        redacted = redacted[:start] + replacement + redacted[end:]
+    return redacted
 
 
 class SecretScannerAgent:
-    """Agent that scans source code for hardcoded secrets using regex heuristics and LLM verification."""
+    """Find hardcoded credentials locally without disclosing them to an AI provider."""
 
-    def __init__(self, provider: AIProvider) -> None:
+    def __init__(self, provider: AIProvider | None = None) -> None:
+        # Kept for API compatibility. Secret material is never sent to this provider.
         self._provider = provider
 
-        # Basic regex heuristics to find files worth sending to the LLM (to save tokens)
-        self._heuristics = [
-            re.compile(r"(?i)(api[_-]?key|secret|password|token|credentials|auth)[\s:=]+[\"'][a-zA-Z0-9_\-\+=\/]{8,}[\"']"),
-            re.compile(r"AKIA[0-9A-Z]{16}"), # AWS Access Key
-            re.compile(r"ghp_[a-zA-Z0-9]{36}"), # GitHub Personal Access Token
-            re.compile(r"-----BEGIN (RSA|OPENSSH|DSA|EC|PGP) PRIVATE KEY-----"), # Private Keys
-            re.compile(r"postgres://[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+@"), # Postgres connection string
-            re.compile(r"mongodb(\+srv)?://[a-zA-Z0-9_-]+:[a-zA-Z0-9_-]+@"), # MongoDB connection string
-            re.compile(r"(?i)(sk-|sk_live_|sk_test_)[a-zA-Z0-9]{20,}"),  # Stripe/OpenAI keys
-            re.compile(r"(?i)bearer\s+[a-zA-Z0-9._\-]{20,}"),  # Bearer tokens
-        ]
-
-    def _might_contain_secrets(self, content: str) -> bool:
-        """Check if the content triggers any secret regex heuristics."""
-        for pattern in self._heuristics:
-            if pattern.search(content):
-                return True
-        return False
-
     async def analyze(self, legacy_sources: Mapping[str, str]) -> list[ThreatFinding]:
-        """Analyze the source files for hardcoded secrets."""
-        suspicious_files: dict[str, str] = {}
-        
+        findings: list[ThreatFinding] = []
+        seen: set[tuple[str, int, int]] = set()
+
         for file_path, content in legacy_sources.items():
-            # Skip likely binary or very large files
-            if len(content) > 100_000:
+            if len(content.encode("utf-8", errors="ignore")) > 256 * 1024:
                 continue
-            
-            # Skip dependency manifests (SCA handles these) and lockfiles
-            if any(file_path.endswith(ext) for ext in [".lock", "package-lock.json", "yarn.lock"]):
-                continue
-
-            if self._might_contain_secrets(content):
-                suspicious_files[file_path] = content
-
-        if not suspicious_files:
-            logger.info("No suspicious files found for Secret Scanning.")
-            return []
-
-        logger.info(f"Analyzing {len(suspicious_files)} suspicious files for secrets.")
-        
-        file_sections = []
-        for filepath, content in suspicious_files.items():
-            file_sections.append(f"--- {filepath} ---\n{content[:16_000]}")
-        input_text = "\n\n".join(file_sections)
-
-        try:
-            raw = await self._provider.generate_structured(
-                StructuredOutputRequest(
-                    instructions=(
-                        "You are an expert DevSecOps Secret Scanner tool.\n"
-                        "Analyze the following source code files and identify any hardcoded secrets "
-                        "(API keys, passwords, tokens, private keys, connection strings, etc.).\n"
-                        "Return a list of secrets found. IMPORTANT: In the line_snippet, you MUST mask "
-                        "the actual secret value (e.g. 'api_key = \"AKIA********\"'). Do not return the "
-                        "raw secret in the JSON output.\n"
-                        "Return a JSON object matching the schema."
-                    ),
-                    input_text=input_text,
-                    schema_name="secret-analysis-result",
-                    json_schema=_SECRET_SCHEMA,
-                    max_output_tokens=4_000,
+            for pattern, match, value, line_start, line_end in _iter_matches(content):
+                line_number = content.count("\n", 0, match.start()) + 1
+                value_start, value_end = match.span(pattern.group)
+                identity = (file_path, value_start, value_end)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                line = content[line_start:line_end]
+                relative_start = value_start - line_start
+                relative_end = value_end - line_start
+                masked_line = line[:relative_start] + _mask(value) + line[relative_end:]
+                digest = hashlib.sha256(f"{file_path}:{line_number}:{pattern.kind}".encode()).hexdigest()[:12]
+                findings.append(
+                    ThreatFinding(
+                        finding_id=f"SECRET-{digest}",
+                        cwe="CWE-798",
+                        severity=pattern.severity,
+                        summary=f"Hardcoded {pattern.kind} in {file_path}",
+                        affected_nodes=[file_path],
+                        evidence=[f"line {line_number}: {masked_line.strip()[:300]}"],
+                    )
                 )
-            )
-            result = SecretAnalysisResult.model_validate_json(raw)
-        except Exception as e:
-            # Never masquerade a provider outage as a clean scan — the pipeline
-            # degrades per-agent and surfaces the failure in the swarm status.
-            logger.warning(f"Secret Scanner Agent analysis failed: {e}")
-            raise
 
-        threat_findings = []
-        for secret in result.secrets:
-            finding_id = f"SECRET-{uuid.uuid4().hex[:8]}"
-            threat_findings.append(ThreatFinding(
-                finding_id=finding_id,
-                cwe="CWE-798",  # Use of Hard-coded Credentials
-                severity=secret.severity,
-                summary=f"Hardcoded {secret.secret_type} in {secret.affected_file}: {secret.description}",
-                affected_nodes=[secret.affected_file],
-                evidence=[f"Found masked secret: `{secret.line_snippet}`"]
-            ))
-            
-        return threat_findings
+        logger.info("Local secret scan completed", extra={"findings": len(findings)})
+        return findings
+
+
+__all__ = ["SecretScannerAgent", "redact_secrets"]
