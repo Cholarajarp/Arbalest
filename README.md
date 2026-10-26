@@ -57,16 +57,24 @@ not been run; these capabilities are not evidence of superiority to another tool
 ## ⚡ Quick Start
 
 ```bash
-# 1. Configure your provider and credentials
+# 1. Install (Python 3.12+)
+git clone https://github.com/Cholarajarp/Arbalest.git
+cd Arbalest
+python -m venv .venv
+source .venv/bin/activate        # Windows: .venv\Scripts\activate
+pip install -e .
+
+# 2. Configure your provider and credentials
 cp .env.example .env
 # Set ARBALEST_PROVIDER, the selected provider's key, and ARBALEST_MODEL.
 # Configure your sandbox separately if you want to verify generated code.
 
-# 2. Check provider readiness and run a scan
+# 3. Check provider readiness and run a scan
 arbalest providers
-.venv/Scripts/python arbalest_cli.py scan ./my-repo
+arbalest sandbox-check
+arbalest scan examples/immune_target
 
-# 3. Exit-code contract (CI gate)
+# 4. Exit-code contract (CI gate)
 echo $?
 # 0 = SECURED   1 = VULNERABLE   2 = MISSION ERROR
 ```
